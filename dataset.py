@@ -67,7 +67,9 @@ def make_splits(
 
     slide_stats = rest.groupby("slide")["label"].mean().reset_index()
     slide_stats.columns = ["slide", "pos_frac"]
-    slide_stats["bin"] = (slide_stats["pos_frac"] >= slide_stats["pos_frac"].median()).astype(int)
+    slide_stats["bin"] = (
+        slide_stats["pos_frac"] >= slide_stats["pos_frac"].median()
+    ).astype(int)
 
     slides = slide_stats["slide"].tolist()
     bins = slide_stats["bin"].tolist()
@@ -168,14 +170,16 @@ class PatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        img = read_image(self.paths[idx], mode=ImageReadMode.RGB)  # (3, H, W) uint8
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        img = read_image(self.paths[index], mode=ImageReadMode.RGB)  # (3, H, W) uint8
         img = self.transform(img)
-        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        label = torch.tensor(self.labels[index], dtype=torch.float32)
         return img, label
 
 
-def make_train_transform(aug_strength: Literal["mild", "strong"] = "mild") -> v2.Compose:
+def make_train_transform(
+    aug_strength: Literal["mild", "strong"] = "mild",
+) -> v2.Compose:
     """Training augmentation pipeline.
 
     Uses ``torchvision.transforms.v2`` throughout so transforms operate directly on
@@ -195,7 +199,9 @@ def make_train_transform(aug_strength: Literal["mild", "strong"] = "mild") -> v2
     if aug_strength == "strong":
         jitter = v2.ColorJitter(brightness=0.2, contrast=0.15, saturation=0.1, hue=0.05)
     else:
-        jitter = v2.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.02)
+        jitter = v2.ColorJitter(
+            brightness=0.05, contrast=0.05, saturation=0.05, hue=0.02
+        )
     return v2.Compose(
         [
             v2.RandomHorizontalFlip(p=0.5),
@@ -203,7 +209,7 @@ def make_train_transform(aug_strength: Literal["mild", "strong"] = "mild") -> v2
             v2.RandomApply([v2.RandomRotation((90, 90))], p=0.5),
             jitter,
             v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            v2.Normalize(mean=DATASET_MEAN, std=DATASET_STD),
         ]
     )
 
@@ -213,6 +219,6 @@ def make_eval_transform() -> v2.Compose:
     return v2.Compose(
         [
             v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            v2.Normalize(mean=DATASET_MEAN, std=DATASET_STD),
         ]
     )
