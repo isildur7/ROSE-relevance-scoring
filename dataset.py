@@ -191,17 +191,23 @@ def make_train_transform(
     Rotation is applied as exactly 90° with probability 0.5 to avoid interpolation
     artifacts from fractional angles.
 
-    Color jitter values are conservative by design: in DiffQuik cytology staining,
-    color is diagnostically meaningful (pink cytoplasm, blue/purple nuclei), so
-    large color perturbations would destroy signal.
+    Color jitter values for ``"mild"`` are conservative; ``"strong"`` uses ranges
+    calibrated for DiffQuik: DiffQuik spans a wider hue band (deep blue-purple nuclei
+    to magenta-pink cytoplasm) than H&E, and inter-slide saturation varies substantially,
+    so saturation is expressed as a multiplicative range rather than a symmetric offset.
 
     Args:
         aug_strength: ``"mild"`` uses subtle jitter (brightness/contrast/saturation=0.05,
-            hue=0.02). ``"strong"`` uses more aggressive jitter (brightness=0.2,
-            contrast=0.15, saturation=0.1, hue=0.05).
+            hue=0.02). ``"strong"`` uses DiffQuik-calibrated jitter (brightness=0.25,
+            contrast=0.2, saturation=[0.7, 1.3], hue=0.09).
     """
     if aug_strength == "strong":
-        jitter = v2.ColorJitter(brightness=0.2, contrast=0.15, saturation=0.1, hue=0.05)
+        jitter = v2.ColorJitter(
+            brightness=0.25,
+            contrast=0.2,
+            saturation=(0.7, 1.3),
+            hue=0.09,
+        )
     else:
         jitter = v2.ColorJitter(
             brightness=0.05, contrast=0.05, saturation=0.05, hue=0.02
