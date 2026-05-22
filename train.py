@@ -448,7 +448,7 @@ def _run_diagnostics(
     Returns:
         Nested dict ``{split: {logits, labels, scores, auc, accuracy, ...}}``.
     """
-    model = PatchClassifier.load_from_checkpoint(ckpt_path).to(device)
+    model = PatchClassifier.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
 
     loaders = {
         "train": datamodule.full_train_dataloader(),
