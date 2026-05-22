@@ -110,6 +110,10 @@ class PatchClassifier(LightningModule):
         self.val_recall = BinaryRecall()
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
+        self.test_loss = MeanMetric()
+        self.test_auroc = BinaryAUROC()
+        self.test_acc = BinaryAccuracy()
+        self.test_recall = BinaryRecall()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the backbone.
@@ -167,6 +171,34 @@ class PatchClassifier(LightningModule):
         self.val_acc.reset()
         self.val_recall.reset()
 
+    def test_step(self, batch: tuple, batch_idx: int) -> None:
+        """Accumulate test metrics for one batch.
+
+        Args:
+            batch: Tuple of (images, labels).
+            batch_idx: Index of the current batch.
+        """
+        imgs, labels = batch
+        logits = self(imgs).squeeze(1)
+        loss = self.criterion(logits, labels)
+        preds = torch.sigmoid(logits)
+        self.test_loss.update(loss)
+        self.test_auroc.update(preds, labels.int())
+        self.test_acc.update(preds, labels.int())
+        self.test_recall.update(preds, labels.int())
+
+    def on_test_epoch_end(self) -> None:
+        self.log("test/loss", self.test_loss.compute(), prog_bar=True, on_epoch=True)
+        self.log("test/auroc", self.test_auroc.compute(), prog_bar=True, on_epoch=True)
+        self.log("test/acc", self.test_acc.compute(), prog_bar=True, on_epoch=True)
+        self.log(
+            "test/recall", self.test_recall.compute(), prog_bar=True, on_epoch=True
+        )
+        self.test_loss.reset()
+        self.test_auroc.reset()
+        self.test_acc.reset()
+        self.test_recall.reset()
+
     def configure_optimizers(self) -> OptimizerLRScheduler:
         optimizer = AdamW(
             self.parameters(),
@@ -203,7 +235,7 @@ class PatchDataModule(LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 8,
         seed: int = 42,
-        split_seed: int = 42,
+        split_seed: int = 9,
         sampling_mode: Literal["undersample", "oversample"] = "undersample",
         split_mode: Literal["slide", "random"] = "slide",
         aug_strength: Literal["mild", "strong"] = "mild",
@@ -450,7 +482,9 @@ def _run_diagnostics(
     Returns:
         Nested dict ``{split: {logits, labels, scores, auc, accuracy, ...}}``.
     """
-    model = PatchClassifier.load_from_checkpoint(ckpt_path, weights_only=False).to(device)
+    model = PatchClassifier.load_from_checkpoint(ckpt_path, weights_only=False).to(
+        device
+    )
 
     loaders = {
         "train": datamodule.full_train_dataloader(),
@@ -655,6 +689,8 @@ def main(
 
     best_ckpt = Path(checkpoint_cb.best_model_path)
     log.info("Best checkpoint: %s", best_ckpt)
+
+    trainer.test(model, datamodule=datamodule, ckpt_path=str(best_ckpt))
 
     results = _run_diagnostics(best_ckpt, datamodule, exp_dir, device)
 
