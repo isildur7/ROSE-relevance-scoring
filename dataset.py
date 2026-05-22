@@ -4,9 +4,10 @@ import random
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from torch.utils.data import Dataset, Sampler
 from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import v2
@@ -67,30 +68,19 @@ def make_splits(
     df["slide"] = df["filepath"].apply(lambda f: Path(f).stem.split("__fovr")[0])
 
     pinned = df[df["slide"].isin(PINNED_TRAIN_SLIDES)]
-    rest = df[~df["slide"].isin(PINNED_TRAIN_SLIDES)]
+    rest = df[~df["slide"].isin(PINNED_TRAIN_SLIDES)].reset_index(drop=True)
 
-    slide_stats = rest.groupby("slide")["label"].mean().reset_index()
-    slide_stats.columns = ["slide", "pos_frac"]
-    slide_stats["bin"] = (
-        slide_stats["pos_frac"] >= slide_stats["pos_frac"].median()
-    ).astype(int)
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+    fold_ids = np.empty(len(rest), dtype=int)
+    for fold_idx, (_, test_idx) in enumerate(
+        sgkf.split(rest, rest["label"], rest["slide"])
+    ):
+        fold_ids[test_idx] = fold_idx
 
-    slides = slide_stats["slide"].tolist()
-    bins = slide_stats["bin"].tolist()
-
-    train_slides, temp_slides, _, temp_bins = train_test_split(
-        slides, bins, test_size=0.40, stratify=bins, random_state=seed
-    )
-    val_slides, test_slides = train_test_split(
-        temp_slides, test_size=0.50, stratify=temp_bins, random_state=seed
-    )
-
-    train_df = pd.concat(
-        [pinned, rest[rest["slide"].isin(set(train_slides))]],
-        ignore_index=True,
-    )
-    val_df = rest[rest["slide"].isin(set(val_slides))].reset_index(drop=True)
-    test_df = rest[rest["slide"].isin(set(test_slides))].reset_index(drop=True)
+    # fold 0 → val, fold 1 → test, folds 2-4 → train
+    val_df = rest[fold_ids == 0].reset_index(drop=True)
+    test_df = rest[fold_ids == 1].reset_index(drop=True)
+    train_df = pd.concat([pinned, rest[fold_ids >= 2]], ignore_index=True)
 
     return train_df, val_df, test_df
 
