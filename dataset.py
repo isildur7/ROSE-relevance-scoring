@@ -24,7 +24,7 @@ DATASET_STD: list[float] = [0.4178890585899353, 0.4056206941604614, 0.4557138383
 def make_splits(
     parquet_path: Path,
     patch_dir: Path,
-    seed: int = 42,
+    seed: int = 9,
     split_mode: Literal["slide", "random"] = "slide",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split the patch annotation table into train / val / test sets.
@@ -70,7 +70,7 @@ def make_splits(
     pinned = df[df["slide"].isin(PINNED_TRAIN_SLIDES)]
     rest = df[~df["slide"].isin(PINNED_TRAIN_SLIDES)].reset_index(drop=True)
 
-    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+    sgkf = StratifiedGroupKFold(n_splits=9, shuffle=True, random_state=seed)
     fold_ids = np.empty(len(rest), dtype=int)
     for fold_idx, (_, test_idx) in enumerate(
         sgkf.split(rest, rest["label"], rest["slide"])
@@ -79,8 +79,8 @@ def make_splits(
 
     # fold 0 → val, fold 1 → test, folds 2-4 → train
     val_df = rest[fold_ids == 0].reset_index(drop=True)
-    test_df = rest[fold_ids == 1].reset_index(drop=True)
-    train_df = pd.concat([pinned, rest[fold_ids >= 2]], ignore_index=True)
+    test_df = rest[(fold_ids == 1) | (fold_ids == 2)].reset_index(drop=True)
+    train_df = pd.concat([pinned, rest[fold_ids >= 3]], ignore_index=True)
 
     return train_df, val_df, test_df
 
