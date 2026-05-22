@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,12 +14,14 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision.models as tvm
+import wandb
 import yaml
 from jsonargparse import CLI
 from lightning import seed_everything
 from lightning.pytorch import LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     RocCurveDisplay,
@@ -34,7 +37,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torchmetrics import MeanMetric
-from torchmetrics.classification import BinaryAUROC, BinaryAccuracy, BinaryRecall
+from torchmetrics.classification import BinaryAccuracy, BinaryAUROC, BinaryRecall
 
 from dataset import (
     BalancedBatchSampler,
@@ -77,6 +80,10 @@ class PatchClassifier(LightningModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        self._lr: float = lr
+        self._weight_decay: float = weight_decay
+        self._max_epochs: int = max_epochs
+        self._lr_schedule: Literal["cosine", "constant"] = lr_schedule
 
         if architecture == "efficientnet_b0":
             weights = tvm.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
@@ -128,9 +135,13 @@ class PatchClassifier(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         self.log("train/loss", self.train_loss.compute(), prog_bar=True, on_epoch=True)
-        self.log("train/auroc", self.train_auroc.compute(), prog_bar=True, on_epoch=True)
+        self.log(
+            "train/auroc", self.train_auroc.compute(), prog_bar=True, on_epoch=True
+        )
         self.log("train/acc", self.train_acc.compute(), prog_bar=True, on_epoch=True)
-        self.log("train/recall", self.train_recall.compute(), prog_bar=True, on_epoch=True)
+        self.log(
+            "train/recall", self.train_recall.compute(), prog_bar=True, on_epoch=True
+        )
         self.train_loss.reset()
         self.train_auroc.reset()
         self.train_acc.reset()
@@ -156,15 +167,15 @@ class PatchClassifier(LightningModule):
         self.val_acc.reset()
         self.val_recall.reset()
 
-    def configure_optimizers(self) -> dict | torch.optim.Optimizer:
+    def configure_optimizers(self) -> OptimizerLRScheduler:
         optimizer = AdamW(
             self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
+            lr=self._lr,
+            weight_decay=self._weight_decay,
         )
-        if self.hparams.lr_schedule == "constant":
+        if self._lr_schedule == "constant":
             return optimizer
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.hparams.max_epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self._max_epochs)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
@@ -198,6 +209,14 @@ class PatchDataModule(LightningDataModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        self._parquet_path: Path = parquet_path
+        self._patch_dir: Path = patch_dir
+        self._batch_size: int = batch_size
+        self._num_workers: int = num_workers
+        self._seed: int = seed
+        self._sampling_mode: Literal["undersample", "oversample"] = sampling_mode
+        self._split_mode: Literal["slide", "random"] = split_mode
+        self._aug_strength: Literal["mild", "strong"] = aug_strength
         self.train_df: pd.DataFrame | None = None
         self.val_df: pd.DataFrame | None = None
         self.test_df: pd.DataFrame | None = None
@@ -206,10 +225,10 @@ class PatchDataModule(LightningDataModule):
         if self.train_df is not None:
             return
         self.train_df, self.val_df, self.test_df = make_splits(
-            self.hparams.parquet_path,
-            self.hparams.patch_dir,
-            self.hparams.seed,
-            self.hparams.split_mode,
+            self._parquet_path,
+            self._patch_dir,
+            self._seed,
+            self._split_mode,
         )
         log.info(
             "Split sizes — train: %d, val: %d, test: %d",
@@ -219,46 +238,56 @@ class PatchDataModule(LightningDataModule):
         )
 
     def _loader_kwargs(self) -> dict:
-        nw = self.hparams.num_workers
+        nw = self._num_workers
         kwargs: dict = dict(num_workers=nw, pin_memory=True, persistent_workers=nw > 0)
         if nw > 0:
             kwargs["prefetch_factor"] = 2
         return kwargs
 
     def train_dataloader(self) -> DataLoader:
-        dataset = PatchDataset(self.train_df, make_train_transform(self.hparams.aug_strength))
+        assert self.train_df is not None, (
+            "setup() must be called before train_dataloader()"
+        )
+        dataset = PatchDataset(self.train_df, make_train_transform(self._aug_strength))
         sampler = BalancedBatchSampler(
             dataset.labels,
-            self.hparams.sampling_mode,
-            self.hparams.batch_size,
-            self.hparams.seed,
+            self._sampling_mode,
+            self._batch_size,
+            self._seed,
         )
         return DataLoader(dataset, batch_sampler=sampler, **self._loader_kwargs())
 
     def val_dataloader(self) -> DataLoader:
+        assert self.val_df is not None, "setup() must be called before val_dataloader()"
         dataset = PatchDataset(self.val_df, make_eval_transform())
         return DataLoader(
             dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=self._batch_size,
             shuffle=False,
             **self._loader_kwargs(),
         )
 
     def test_dataloader(self) -> DataLoader:
+        assert self.test_df is not None, (
+            "setup() must be called before test_dataloader()"
+        )
         dataset = PatchDataset(self.test_df, make_eval_transform())
         return DataLoader(
             dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=self._batch_size,
             shuffle=False,
             **self._loader_kwargs(),
         )
 
     def full_train_dataloader(self) -> DataLoader:
         """Full training set without balanced sampling, for post-training diagnostics."""
+        assert self.train_df is not None, (
+            "setup() must be called before full_train_dataloader()"
+        )
         dataset = PatchDataset(self.train_df, make_eval_transform())
         return DataLoader(
             dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=self._batch_size,
             shuffle=False,
             **self._loader_kwargs(),
         )
@@ -267,6 +296,7 @@ class PatchDataModule(LightningDataModule):
 # ---------------------------------------------------------------------------
 # Experiment naming
 # ---------------------------------------------------------------------------
+
 
 def _next_exp_name(
     experiments_dir: Path,
@@ -291,7 +321,7 @@ def _next_exp_name(
         for d in experiments_dir.iterdir():
             if d.is_dir() and d.name.startswith(prefix):
                 try:
-                    max_n = max(max_n, int(d.name[len(prefix):]))
+                    max_n = max(max_n, int(d.name[len(prefix) :]))
                 except ValueError:
                     pass
     return f"{prefix}{max_n + 1:03d}"
@@ -300,6 +330,7 @@ def _next_exp_name(
 # ---------------------------------------------------------------------------
 # Post-training diagnostics
 # ---------------------------------------------------------------------------
+
 
 def _infer(
     model: PatchClassifier,
@@ -433,21 +464,32 @@ def _run_diagnostics(
         metrics = _compute_metrics(labels, scores)
 
         _save_confusion_matrix(
-            labels, scores,
+            labels,
+            scores,
             figures_dir / f"{split}_confusion.png",
             f"{split.capitalize()} — Confusion Matrix",
         )
         _save_roc_curve(
-            labels, scores,
+            labels,
+            scores,
             figures_dir / f"{split}_roc.png",
             f"{split.capitalize()} — ROC",
         )
 
-        results[split] = {"logits": logits, "labels": labels, "scores": scores, **metrics}
+        results[split] = {
+            "logits": logits,
+            "labels": labels,
+            "scores": scores,
+            **metrics,
+        }
         log.info(
             "[%s] AUC=%.4f  Acc=%.4f  Precision=%.4f  Recall=%.4f  F1=%.4f",
-            split, metrics["auc"], metrics["accuracy"],
-            metrics["precision"], metrics["recall"], metrics["f1"],
+            split,
+            metrics["auc"],
+            metrics["accuracy"],
+            metrics["precision"],
+            metrics["recall"],
+            metrics["f1"],
         )
 
     return results
@@ -456,6 +498,7 @@ def _run_diagnostics(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main(
     parquet_path: Path,
@@ -554,6 +597,9 @@ def main(
     )
     datamodule.setup()
 
+    assert datamodule.train_df is not None
+    assert datamodule.val_df is not None
+    assert datamodule.test_df is not None
     splits_rows = [
         datamodule.train_df.assign(split="train"),
         datamodule.val_df.assign(split="val"),
@@ -573,7 +619,13 @@ def main(
         dropout_rate=dropout_rate,
     )
 
-    tb_logger = TensorBoardLogger(save_dir=str(exp_dir), name="tensorboard")
+    wandb_logger = WandbLogger(
+        project="ROSE-relevance",
+        name=exp_name,
+        group=f"{architecture}_{weights_tag}_{sampling_mode}",
+        save_dir=str(exp_dir),
+    )
+    wandb_logger.log_hyperparams(config)
 
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(exp_dir / "checkpoints"),
@@ -586,8 +638,8 @@ def main(
 
     trainer = Trainer(
         max_epochs=max_epochs,
-        logger=tb_logger,
-        callbacks=[checkpoint_cb],
+        logger=wandb_logger,
+        callbacks=[checkpoint_cb, LearningRateMonitor("epoch")],
         log_every_n_steps=10,
         accelerator="gpu" if use_gpu else "cpu",
         devices=[gpu] if use_gpu else 1,
@@ -602,6 +654,7 @@ def main(
     with open(exp_dir / "results.pkl", "wb") as fh:
         pickle.dump(results, fh)
 
+    wandb.finish()
     log.info("Experiment complete. Outputs at %s", exp_dir)
 
 
