@@ -203,6 +203,7 @@ class PatchDataModule(LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 8,
         seed: int = 42,
+        split_seed: int = 42,
         sampling_mode: Literal["undersample", "oversample"] = "undersample",
         split_mode: Literal["slide", "random"] = "slide",
         aug_strength: Literal["mild", "strong"] = "mild",
@@ -214,6 +215,7 @@ class PatchDataModule(LightningDataModule):
         self._batch_size: int = batch_size
         self._num_workers: int = num_workers
         self._seed: int = seed
+        self._split_seed: int = split_seed
         self._sampling_mode: Literal["undersample", "oversample"] = sampling_mode
         self._split_mode: Literal["slide", "random"] = split_mode
         self._aug_strength: Literal["mild", "strong"] = aug_strength
@@ -227,7 +229,7 @@ class PatchDataModule(LightningDataModule):
         self.train_df, self.val_df, self.test_df = make_splits(
             self._parquet_path,
             self._patch_dir,
-            self._seed,
+            self._split_seed,
             self._split_mode,
         )
         log.info(
@@ -505,6 +507,7 @@ def main(
     patch_dir: Path,
     output_dir: Path,
     seed: int = 42,
+    split_seed: int = 42,
     pretrained: bool = False,
     sampling_mode: Literal["undersample", "oversample"] = "undersample",
     lr: float = 1e-3,
@@ -529,7 +532,9 @@ def main(
         parquet_path: Path to ``patches_annotations.parquet``.
         patch_dir: Directory containing the JPEG patches.
         output_dir: Root output directory; ``experiments/`` is created inside.
-        seed: Random seed for splits, sampler, and model initialisation.
+        seed: Random seed for the batch sampler and model initialisation (training randomness).
+        split_seed: Random seed for the train/val/test split. Kept separate from ``seed``
+            so the data partition can be held fixed while varying training randomness.
         pretrained: Initialise from ImageNet weights (default: train from scratch).
         sampling_mode: ``"undersample"`` exhausts positives once per epoch;
             ``"oversample"`` exhausts negatives once per epoch.
@@ -568,6 +573,7 @@ def main(
         "patch_dir": str(patch_dir),
         "output_dir": str(output_dir),
         "seed": seed,
+        "split_seed": split_seed,
         "pretrained": pretrained,
         "sampling_mode": sampling_mode,
         "lr": lr,
@@ -591,6 +597,7 @@ def main(
         batch_size=batch_size,
         num_workers=num_workers,
         seed=seed,
+        split_seed=split_seed,
         sampling_mode=sampling_mode,
         split_mode=split_mode,
         aug_strength=aug_strength,
