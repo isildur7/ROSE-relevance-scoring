@@ -690,7 +690,8 @@ def main(
     best_ckpt = Path(checkpoint_cb.best_model_path)
     log.info("Best checkpoint: %s", best_ckpt)
 
-    trainer.test(model, datamodule=datamodule, ckpt_path=str(best_ckpt))
+    model_for_test = PatchClassifier.load_from_checkpoint(str(best_ckpt), weights_only=False)
+    trainer.test(model_for_test, datamodule=datamodule)
 
     results = _run_diagnostics(best_ckpt, datamodule, exp_dir, device)
 
