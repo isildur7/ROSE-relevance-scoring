@@ -430,7 +430,7 @@ def _save_confusion_matrix(
     cm = confusion_matrix(labels, preds)
     disp = ConfusionMatrixDisplay(cm, display_labels=["Non-informative", "Informative"])
     fig, ax = plt.subplots(figsize=(5, 4))
-    disp.plot(ax=ax, colorbar=False)
+    disp.plot(ax=ax, colorbar=False)  # type: ignore
     ax.set_title(title)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -455,7 +455,7 @@ def _save_roc_curve(
     fpr, tpr, _ = roc_curve(labels, scores)
     disp = RocCurveDisplay(fpr=fpr, tpr=tpr, roc_auc=auc_val)
     fig, ax = plt.subplots(figsize=(5, 4))
-    disp.plot(ax=ax)
+    disp.plot(ax=ax)  # type: ignore
     ax.set_title(f"{title} (AUC={auc_val:.3f})")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
