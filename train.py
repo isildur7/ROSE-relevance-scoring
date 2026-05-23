@@ -100,7 +100,7 @@ class PatchClassifier(LightningModule):
                 nn.Linear(512, 1),
             )
 
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.criterion = nn.BCELoss()
 
         self.train_auroc = BinaryAUROC()
         self.train_acc = BinaryAccuracy()
@@ -122,19 +122,18 @@ class PatchClassifier(LightningModule):
             x: Float32 image tensor of shape (B, 3, H, W).
 
         Returns:
-            Raw logit tensor of shape (B, 1).
+            Sigmoid probability tensor of shape (B, 1).
         """
-        return self.backbone(x)
+        return torch.sigmoid(self.backbone(x))
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         imgs, labels = batch
-        logits = self(imgs).squeeze(1)
-        loss = self.criterion(logits, labels)
-        preds = torch.sigmoid(logits)
+        probs = self(imgs).squeeze(1)
+        loss = self.criterion(probs, labels)
         self.train_loss.update(loss)
-        self.train_auroc.update(preds, labels.int())
-        self.train_acc.update(preds, labels.int())
-        self.train_recall.update(preds, labels.int())
+        self.train_auroc.update(probs, labels.int())
+        self.train_acc.update(probs, labels.int())
+        self.train_recall.update(probs, labels.int())
         return loss
 
     def on_train_epoch_end(self) -> None:
@@ -153,13 +152,12 @@ class PatchClassifier(LightningModule):
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
         imgs, labels = batch
-        logits = self(imgs).squeeze(1)
-        loss = self.criterion(logits, labels)
-        preds = torch.sigmoid(logits)
+        probs = self(imgs).squeeze(1)
+        loss = self.criterion(probs, labels)
         self.val_loss.update(loss)
-        self.val_auroc.update(preds, labels.int())
-        self.val_acc.update(preds, labels.int())
-        self.val_recall.update(preds, labels.int())
+        self.val_auroc.update(probs, labels.int())
+        self.val_acc.update(probs, labels.int())
+        self.val_recall.update(probs, labels.int())
 
     def on_validation_epoch_end(self) -> None:
         self.log("val/loss", self.val_loss.compute(), prog_bar=True, on_epoch=True)
@@ -179,13 +177,12 @@ class PatchClassifier(LightningModule):
             batch_idx: Index of the current batch.
         """
         imgs, labels = batch
-        logits = self(imgs).squeeze(1)
-        loss = self.criterion(logits, labels)
-        preds = torch.sigmoid(logits)
+        probs = self(imgs).squeeze(1)
+        loss = self.criterion(probs, labels)
         self.test_loss.update(loss)
-        self.test_auroc.update(preds, labels.int())
-        self.test_acc.update(preds, labels.int())
-        self.test_recall.update(preds, labels.int())
+        self.test_auroc.update(probs, labels.int())
+        self.test_acc.update(probs, labels.int())
+        self.test_recall.update(probs, labels.int())
 
     def on_test_epoch_end(self) -> None:
         self.log("test/loss", self.test_loss.compute(), prog_bar=True, on_epoch=True)
@@ -379,17 +376,17 @@ def _infer(
         device: Device to run inference on.
 
     Returns:
-        Tuple of (logits, labels) as float32 numpy arrays of shape (N,).
+        Tuple of (probs, labels) as float32 numpy arrays of shape (N,).
     """
     model.eval()
-    all_logits: list[torch.Tensor] = []
+    all_probs: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
     with torch.no_grad():
         for imgs, labels in loader:
-            logits = model(imgs.to(device)).squeeze(1)
-            all_logits.append(logits.cpu())
+            probs = model(imgs.to(device)).squeeze(1)
+            all_probs.append(probs.cpu())
             all_labels.append(labels.cpu())
-    return torch.cat(all_logits).numpy(), torch.cat(all_labels).numpy()
+    return torch.cat(all_probs).numpy(), torch.cat(all_labels).numpy()
 
 
 def _save_confusion_matrix(
@@ -495,8 +492,7 @@ def _run_diagnostics(
     results: dict = {}
 
     for split, loader in loaders.items():
-        logits, labels = _infer(model, loader, device)
-        scores = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+        scores, labels = _infer(model, loader, device)
         metrics = _compute_metrics(labels, scores)
 
         _save_confusion_matrix(
@@ -513,9 +509,8 @@ def _run_diagnostics(
         )
 
         results[split] = {
-            "logits": logits,
-            "labels": labels,
             "scores": scores,
+            "labels": labels,
             **metrics,
         }
         log.info(
@@ -690,7 +685,9 @@ def main(
     best_ckpt = Path(checkpoint_cb.best_model_path)
     log.info("Best checkpoint: %s", best_ckpt)
 
-    model_for_test = PatchClassifier.load_from_checkpoint(str(best_ckpt), weights_only=False)
+    model_for_test = PatchClassifier.load_from_checkpoint(
+        str(best_ckpt), weights_only=False
+    )
     trainer.test(model_for_test, datamodule=datamodule)
 
     results = _run_diagnostics(best_ckpt, datamodule, exp_dir, device)

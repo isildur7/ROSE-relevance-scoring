@@ -204,6 +204,7 @@ def make_train_transform(
         )
     return v2.Compose(
         [
+            v2.Resize((224, 224), interpolation=v2.InterpolationMode.BICUBIC),
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
             v2.RandomApply([v2.RandomRotation((90, 90))], p=0.5),
@@ -218,6 +219,7 @@ def make_eval_transform() -> v2.Compose:
     """Minimal eval/test pipeline — no augmentation."""
     return v2.Compose(
         [
+            v2.Resize((224, 224), interpolation=v2.InterpolationMode.BICUBIC),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=DATASET_MEAN, std=DATASET_STD),
         ]
