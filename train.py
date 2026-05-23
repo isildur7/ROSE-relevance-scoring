@@ -77,6 +77,7 @@ class PatchClassifier(LightningModule):
         lr_schedule: Literal["cosine", "constant"] = "cosine",
         architecture: Literal["resnet18", "efficientnet_b0"] = "resnet18",
         dropout_rate: float = 0.0,
+        freeze_layers: int = 0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -99,6 +100,7 @@ class PatchClassifier(LightningModule):
                 nn.Dropout(p=dropout_rate),
                 nn.Linear(512, 1),
             )
+            self._freeze_backbone_stages(freeze_layers)
 
         self.criterion = nn.BCELoss()
 
@@ -115,8 +117,29 @@ class PatchClassifier(LightningModule):
         self.test_acc = BinaryAccuracy()
         self.test_recall = BinaryRecall()
 
+    def _freeze_backbone_stages(self, n: int) -> None:
+        """Freeze the first ``n`` stages of the ResNet18 backbone.
+
+        Args:
+            n: Number of stages to freeze, counted from the input end.
+                0 = no freezing; 1 = stem only; 2 = stem + layer1;
+                3 = stem + layer1 + layer2; 4 = stem + layer1 + layer2 + layer3.
+        """
+        if n == 0:
+            return
+        stages: list[list[nn.Module]] = [
+            [self.backbone.conv1, self.backbone.bn1],
+            [self.backbone.layer1],
+            [self.backbone.layer2],
+            [self.backbone.layer3],
+        ]
+        for stage in stages[:n]:
+            for module in stage:
+                for param in module.parameters():
+                    param.requires_grad = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the backbone.
+        """Run the backbone and apply sigmoid.
 
         Args:
             x: Float32 image tensor of shape (B, 3, H, W).
@@ -198,7 +221,7 @@ class PatchClassifier(LightningModule):
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
         optimizer = AdamW(
-            self.parameters(),
+            filter(lambda p: p.requires_grad, self.parameters()),
             lr=self._lr,
             weight_decay=self._weight_decay,
         )
@@ -550,6 +573,7 @@ def main(
     architecture: Literal["resnet18", "efficientnet_b0"] = "resnet18",
     dropout_rate: float = 0.0,
     aug_strength: Literal["mild", "strong"] = "mild",
+    freeze_layers: int = 0,
 ) -> None:
     """Train a binary patch classifier.
 
@@ -579,6 +603,9 @@ def main(
         architecture: Backbone architecture — ``"resnet18"`` or ``"efficientnet_b0"``.
         dropout_rate: Dropout probability before the classification head; ``0.0`` disables.
         aug_strength: Training augmentation intensity — ``"mild"`` or ``"strong"``.
+        freeze_layers: Number of ResNet18 backbone stages to freeze (0 = train all;
+            1 = freeze stem; 2 = freeze stem + layer1; 3 = freeze stem + layer1 + layer2;
+            4 = freeze stem through layer3). Only applies to ``architecture="resnet18"``.
     """
     seed_everything(seed, workers=True)
 
@@ -653,6 +680,7 @@ def main(
         lr_schedule=lr_schedule,
         architecture=architecture,
         dropout_rate=dropout_rate,
+        freeze_layers=freeze_layers,
     )
 
     wandb_logger = WandbLogger(
