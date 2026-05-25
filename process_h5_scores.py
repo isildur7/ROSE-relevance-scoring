@@ -17,16 +17,21 @@ Mirrors the side effects of the legacy
 This is a pure processing tool — no visualizations, no CSV. Run ``score_h5.py``
 for the visualization suite.
 
+Slide selection accepts either an inline ``--slide_list`` or a JSON-Lines
+file (``--slide_info_json``) with one record per slide and a ``patient_id``
+field (mirrors ``ROSE-processing-v2/data_jsons/*.json``).
+
 Example:
     python process_h5_scores.py \\
-        --bag-root /media/data1/kanghyun/ROSE_MIL/DUMC \\
-        --slide-list '[CF15-001815A-3]' \\
+        --bag_root /media/data1/kanghyun/ROSE_MIL/DUMC \\
+        --slide_info_json /home/amey/ROSE-processing-v2/data_jsons/test.json \\
         --checkpoint results/.../last.ckpt \\
-        --bag-pattern 'Bag*.h5'
+        --bag_pattern 'Bag*.h5'
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -42,6 +47,32 @@ from scoring.scorer import score_tile_batches
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def _patient_ids_from_jsonl(path: Path) -> list[str]:
+    """Read a JSON-Lines file and return its ``patient_id`` column in order.
+
+    Args:
+        path: Path to a ``.json`` / ``.jsonl`` file with one JSON object per
+            line. Each line must contain a ``patient_id`` field, which is
+            used as the slide subdirectory name under ``bag_root``.
+
+    Returns:
+        List of ``patient_id`` strings in file order. Blank lines are skipped.
+    """
+    ids: list[str] = []
+    with path.open("r") as f:
+        for line_num, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "patient_id" not in record:
+                raise ValueError(f"{path}:{line_num}: missing 'patient_id' field")
+            ids.append(str(record["patient_id"]))
+    if not ids:
+        raise ValueError(f"{path}: no records found")
+    return ids
 
 
 def _score_images(
@@ -189,24 +220,31 @@ def _process_one_bag(
 
 def main(
     bag_root: Path,
-    slide_list: list[str],
     checkpoint: Path,
     bag_pattern: str,
+    slide_list: list[str] | None = None,
+    slide_info_json: Path | None = None,
     gpu: int | None = None,
     batch_size: int = 1024,
     verbose: bool = False,
 ) -> None:
-    """Score bag h5 files in place for every slide in ``slide_list``.
+    """Score bag h5 files in place for every slide selected.
+
+    Provide exactly one of ``slide_list`` or ``slide_info_json``.
 
     Args:
         bag_root: Parent directory containing per-slide subdirectories with
             ``bag_pattern`` files (and optionally matching ``features_*.h5``
             files).
-        slide_list: Subdirectory names under ``bag_root`` to process. The
-            model is loaded once and re-used across every slide and bag.
         checkpoint: Trained ``PatchClassifier`` checkpoint (``.ckpt``).
         bag_pattern: Glob pattern matched directly under each slide
             subdirectory (e.g. ``"Bag*.h5"`` or ``"bag_*.h5"``).
+        slide_list: Subdirectory names under ``bag_root`` to process.
+            Mutually exclusive with ``slide_info_json``.
+        slide_info_json: Path to a JSON-Lines file (one JSON object per
+            line) with a ``patient_id`` field per record. ``patient_id``
+            is used as the slide subdirectory name under ``bag_root``.
+            Mutually exclusive with ``slide_list``.
         gpu: GPU index. ``None`` auto-picks CUDA; ``-1`` forces CPU.
         batch_size: Tiles per inference batch.
         verbose: When ``True``, emit per-bag tile-count and score stats at
@@ -214,6 +252,13 @@ def main(
             warnings/errors.
     """
     logging.getLogger().setLevel(logging.INFO if verbose else logging.WARNING)
+
+    if (slide_list is None) == (slide_info_json is None):
+        raise ValueError("Provide exactly one of --slide_list or --slide_info_json")
+    if slide_info_json is not None:
+        slide_list = _patient_ids_from_jsonl(slide_info_json)
+        log.info("Loaded %d slide IDs from %s", len(slide_list), slide_info_json)
+    assert slide_list is not None  # type narrowing for pyrefly
 
     device = resolve_device(gpu)
     if device.type == "cuda":
@@ -243,4 +288,4 @@ def main(
 
 
 if __name__ == "__main__":
-    CLI(main)
+    CLI(main, as_positional=False)
