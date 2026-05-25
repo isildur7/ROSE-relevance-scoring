@@ -20,30 +20,70 @@ DATASET_MEAN: list[float] = [
 ]
 DATASET_STD: list[float] = [0.4178890585899353, 0.4056206941604614, 0.45571383833885193]
 
+# Per-slide diagnosis label_id (0..6) used to stratify the slide-level split by
+# diagnosis instead of by patch label. Diagnoses follow ROSE-processing-v2:
+#   0 Adenocarcinoma, 1 Benign Lung, 2 Benign Lymph node,
+#   3 Granulomatous Inflammation, 4 Lymphoma,
+#   5 Small cell carcinoma, 6 Squamous cell carcinoma.
+SLIDE_TO_DIAGNOSIS: dict[str, int] = {
+    "CF14-003066A-1": 6,
+    "CF14-003074A-1": 1,
+    "CF14-003074A-2": 1,
+    "CF14-003223A-1": 3,
+    "CF14-003223A-2": 3,
+    "CF14-003223B-3": 3,
+    "CF14-003233D-1": 0,
+    "CF14-003233D-4": 0,
+    "CF14-003233D-5": 0,
+    "CF14-003323B-3": 4,
+    "CF14-003323B-4": 4,
+    "CF14-003323B-5": 4,
+    "CF14-003514A-2": 2,
+    "CF14-003514B-3": 2,
+    "CF14-003514B-4": 2,
+    "CF15-000056A-1": 0,
+    "CF15-000056A-2": 0,
+    "CF15-000109A-1": 6,
+    "CF15-000109A-2": 6,
+    "CF15-000109A-4": 6,
+    "CF15-000115A-1": 6,
+    "CF15-000115A-2": 6,
+    "CF15-000115A-3": 6,
+    "CF15-000205A-2": 5,
+    "CF15-000205A-3": 5,
+    "CF15-000606A-2": 6,
+    "CF15-001032A-1": 5,
+}
+
 
 def make_splits(
     parquet_path: Path,
     patch_dir: Path,
-    seed: int = 9,
+    seed: int = 1953,
     split_mode: Literal["slide", "random"] = "slide",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split the patch annotation table into train / val / test sets.
 
     Two modes are supported:
 
-    * ``"slide"`` (default): slide-level stratified split.  ``CF14-003066A-1``
-      is pinned to train; remaining slides are split ~60 / 20 / 20, stratified
-      by each slide's positive-label fraction.
+    * ``"slide"`` (default): slide-level 3-fold split, **stratified by slide
+      diagnosis** (``label_id`` 0..6 from ``SLIDE_TO_DIAGNOSIS``) and grouped
+      by slide. Folds are then assigned: fold 0 → train, fold 1 → val,
+      fold 2 → test. ``CF14-003066A-1`` is pinned to train. With the default
+      ``seed=1953`` the resulting test fold covers all 7 diagnoses, train
+      covers all 7, and val covers 6 (Benign Lung has only two slides total,
+      so at most two of the three splits can contain it).
     * ``"random"``: plain patch-level random split (~60 / 20 / 20), stratified
-      by patch label.  Slide identity is ignored entirely.
+      by patch label. Slide identity is ignored entirely.
 
     Args:
         parquet_path: Path to ``patches_annotations.parquet`` with columns
             ``filepath`` (filename only) and ``label`` (0 or 1).
         patch_dir: Directory containing the JPEG patches; prepended to each filepath.
-        seed: Random seed for reproducibility.
-        split_mode: ``"slide"`` for slide-level grouping; ``"random"`` for a
-            raw patch-level split with no slide consideration.
+        seed: Random seed passed to ``StratifiedGroupKFold`` (default: 1953;
+            verified to yield the diagnosis-balanced split described above).
+        split_mode: ``"slide"`` for slide-level diagnosis-stratified splits;
+            ``"random"`` for a raw patch-level split.
 
     Returns:
         Tuple of (train_df, val_df, test_df), each with columns
@@ -67,20 +107,33 @@ def make_splits(
 
     df["slide"] = df["filepath"].apply(lambda f: Path(f).stem.split("__fovr")[0])
 
-    pinned = df[df["slide"].isin(PINNED_TRAIN_SLIDES)]
-    rest = df[~df["slide"].isin(PINNED_TRAIN_SLIDES)].reset_index(drop=True)
+    missing_dx = set(df["slide"].unique()) - set(SLIDE_TO_DIAGNOSIS)
+    if missing_dx:
+        raise ValueError(
+            f"SLIDE_TO_DIAGNOSIS is missing entries for: {sorted(missing_dx)}"
+        )
 
-    sgkf = StratifiedGroupKFold(n_splits=9, shuffle=True, random_state=seed)
-    fold_ids = np.empty(len(rest), dtype=int)
+    pinned_slides = set(PINNED_TRAIN_SLIDES)
+    unpinned_slides = np.array(
+        sorted(s for s in df["slide"].unique() if s not in pinned_slides)
+    )
+    slide_dx = np.array([SLIDE_TO_DIAGNOSIS[s] for s in unpinned_slides])
+
+    sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=seed)
+    fold_ids = np.empty(len(unpinned_slides), dtype=int)
     for fold_idx, (_, test_idx) in enumerate(
-        sgkf.split(rest, rest["label"], rest["slide"])
+        sgkf.split(unpinned_slides, slide_dx, unpinned_slides)
     ):
         fold_ids[test_idx] = fold_idx
 
-    # fold 0 → val, fold 1 → test, folds 2-4 → train
-    val_df = rest[fold_ids == 0].reset_index(drop=True)
-    test_df = rest[(fold_ids == 1) | (fold_ids == 2)].reset_index(drop=True)
-    train_df = pd.concat([pinned, rest[fold_ids >= 3]], ignore_index=True)
+    # fold 0 → train (+ pinned slides), fold 1 → val, fold 2 → test
+    train_slides: set[str] = set(unpinned_slides[fold_ids == 0]) | pinned_slides
+    val_slides: set[str] = set(unpinned_slides[fold_ids == 1])
+    test_slides: set[str] = set(unpinned_slides[fold_ids == 2])
+
+    train_df = df[df["slide"].isin(train_slides)].reset_index(drop=True)
+    val_df = df[df["slide"].isin(val_slides)].reset_index(drop=True)
+    test_df = df[df["slide"].isin(test_slides)].reset_index(drop=True)
 
     return train_df, val_df, test_df
 
