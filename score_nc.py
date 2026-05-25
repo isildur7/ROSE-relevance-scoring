@@ -7,7 +7,8 @@ score histogram).
 
 Example:
     python score_nc.py \\
-        --slide-path /media/Wednesday/Temporary/amey/DUMC_second/CF15-000507A-6 \\
+        --slide-root /media/Wednesday/Temporary/amey/DUMC_second \\
+        --slide-list '[CF15-000507A-6]' \\
         --checkpoint results/.../last.ckpt \\
         --mask-folder /media/Wednesday/Temporary/kanghyun/new_pen_marks/mask \\
         --output-dir ./claude/score_nc
@@ -23,6 +24,7 @@ import cv2
 import numpy as np
 import torch
 from jsonargparse import CLI
+from tqdm import tqdm
 
 from scoring._annotation import load_annotation
 from scoring.gpu_tiler import iter_tile_batches, load_slide_images
@@ -131,62 +133,84 @@ def _pick_best_fov(
     return best_key
 
 
-def main(
-    slide_path: Path,
-    checkpoint: Path,
-    output_dir: Path,
-    mask_folder: Path | None = None,
-    gpu: int | None = None,
-    batch_size: int = 1024,
-    tile_size: int = 256,
-    pixel_border: int = 0,
-    x_border: int = 2,
-    y_border: int = 2,
-    chunk: int = 27,
-    fov_px: int = 160,
-    fov_y: int | None = None,
-    fov_x: int | None = None,
-    fov_stride: int = 16,
-    export_individual: bool = False,
+def _write_scores_csv(
+    csv_path: Path,
+    cams_np: np.ndarray,
+    coords_np: np.ndarray,
+    scores_np: np.ndarray,
 ) -> None:
-    """Score a full ``.nc`` slide and write all visualizations.
+    """Write per-tile ``FOV_y,FOV_x,pixel_y,pixel_x,score`` rows to ``csv_path``.
+
+    Args:
+        csv_path: Output CSV path.
+        cams_np: ``(N, 2)`` int array of ``(fov_y, fov_x)`` per tile.
+        coords_np: ``(N, 2)`` int array of ``(pixel_y, pixel_x)`` per tile.
+        scores_np: ``(N,)`` float array of tile scores.
+    """
+    table = np.column_stack(
+        [
+            cams_np[:, 0].astype(np.int64),
+            cams_np[:, 1].astype(np.int64),
+            coords_np[:, 0].astype(np.int64),
+            coords_np[:, 1].astype(np.int64),
+            scores_np.astype(np.float64),
+        ]
+    )
+    np.savetxt(
+        csv_path,
+        table,
+        delimiter=",",
+        header="FOV_y,FOV_x,pixel_y,pixel_x,score",
+        comments="",
+        fmt=("%d", "%d", "%d", "%d", "%.6f"),
+    )
+
+
+def _score_one_slide(
+    slide_path: Path,
+    output_dir: Path,
+    device: torch.device,
+    model: torch.nn.Module,
+    mask_folder: Path | None,
+    batch_size: int,
+    tile_size: int,
+    pixel_border: int,
+    x_border: int,
+    y_border: int,
+    chunk: int,
+    fov_px: int,
+    fov_y: int | None,
+    fov_x: int | None,
+    fov_stride: int,
+    export_individual: bool,
+    write_csv: bool,
+) -> None:
+    """Score one ``.nc`` slide and write its visualizations + optional CSV.
 
     Args:
         slide_path: Slide directory containing ``fullslidescan_AIF_WB.nc``.
-        checkpoint: Trained ``PatchClassifier`` checkpoint (``.ckpt``).
-        output_dir: Root output directory. Results are written under
+        output_dir: Root output directory. Results land in
             ``output_dir / slide_path.name / *``.
-        mask_folder: Directory containing per-FOV pen-mark masks named
-            ``<slide>_<row>_<col>.{tif,npy}``. Omit to score every tile.
-        gpu: GPU index. ``None`` auto-picks CUDA; ``-1`` forces CPU
-            (CPU is rejected by the GPU tiler and will error out).
+        device: Resolved inference device.
+        model: Loaded ``PatchClassifier`` in eval mode.
+        mask_folder: Per-FOV pen-mark mask directory, or ``None`` to score all.
         batch_size: Tiles per inference batch.
         tile_size: Tile edge length in pixels.
         pixel_border: Pixel border dropped inside each FOV before tiling.
-        x_border: Number of border FOVs skipped on each side along x.
-        y_border: Number of border FOVs skipped on each side along y.
+        x_border: Border FOVs skipped on each side along x.
+        y_border: Border FOVs skipped on each side along y.
         chunk: FOVs loaded onto GPU per streaming step.
         fov_px: Per-FOV side length in the full-slide mosaic figures.
-        fov_y: Row of the FOV used for the per-FOV heatmap; auto-picked
-            (highest mean score) when ``None``.
-        fov_x: Column of the FOV used for the per-FOV heatmap; auto-picked
-            (highest mean score) when ``None``.
+        fov_y: Row of the FOV used for the per-FOV heatmap; auto-picked when ``None``.
+        fov_x: Column of the FOV used for the per-FOV heatmap; auto-picked when ``None``.
         fov_stride: Sliding-window stride for the per-FOV heatmap.
-        export_individual: Also save unannotated panels alongside combined figures.
+        export_individual: Also save unannotated panels.
+        write_csv: When ``True``, also dump per-tile scores as a CSV.
     """
-    device = resolve_device(gpu)
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
     slide_name = slide_path.name
 
     out_dir = output_dir / slide_name
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    t_model = time.time()
-    model = load_classifier(checkpoint, device)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    t_model = time.time() - t_model
 
     t_load = time.time()
     slide_images = load_slide_images(slide_path)
@@ -285,8 +309,7 @@ def main(
         len(scores_np) / max(t_score, 1e-6),
     )
     log.info(
-        "Phase timings: model_load=%.2fs eager_load=%.2fs score_loop=%.2fs",
-        t_model,
+        "Phase timings: eager_load=%.2fs score_loop=%.2fs",
         t_load,
         t_score,
     )
@@ -297,6 +320,11 @@ def main(
         t_score_total,
         t_collect_total,
     )
+
+    if write_csv:
+        csv_path = out_dir / f"{slide_name}_scores.csv"
+        _write_scores_csv(csv_path, cams_np, coords_np, scores_np)
+        log.info("Wrote per-tile CSV: %s", csv_path)
 
     score_lookup = build_score_lookup(scores_np, cams_np, coords_np, tile_size)
     score_array, image_array = build_slide_arrays(
@@ -367,6 +395,97 @@ def main(
         stride=fov_stride,
         export_individual=export_individual,
     )
+
+
+def main(
+    slide_root: Path,
+    slide_list: list[str],
+    checkpoint: Path,
+    output_dir: Path,
+    mask_folder: Path | None = None,
+    gpu: int | None = None,
+    batch_size: int = 1024,
+    tile_size: int = 256,
+    pixel_border: int = 0,
+    x_border: int = 2,
+    y_border: int = 2,
+    chunk: int = 27,
+    fov_px: int = 160,
+    fov_y: int | None = None,
+    fov_x: int | None = None,
+    fov_stride: int = 16,
+    export_individual: bool = False,
+    verbose: bool = False,
+    write_csv: bool = False,
+) -> None:
+    """Score one or more ``.nc`` slides and write their visualizations.
+
+    Args:
+        slide_root: Parent directory containing slide subdirectories.
+        slide_list: Names of slide subdirectories under ``slide_root``. Each
+            slide is scored and written to ``output_dir / <name> / *``.
+        checkpoint: Trained ``PatchClassifier`` checkpoint (``.ckpt``).
+        output_dir: Root output directory.
+        mask_folder: Directory containing per-FOV pen-mark masks named
+            ``<slide>_<row>_<col>.{tif,npy}``. Omit to score every tile.
+        gpu: GPU index. ``None`` auto-picks CUDA; ``-1`` forces CPU
+            (CPU is rejected by the GPU tiler and will error out).
+        batch_size: Tiles per inference batch.
+        tile_size: Tile edge length in pixels.
+        pixel_border: Pixel border dropped inside each FOV before tiling.
+        x_border: Number of border FOVs skipped on each side along x.
+        y_border: Number of border FOVs skipped on each side along y.
+        chunk: FOVs loaded onto GPU per streaming step.
+        fov_px: Per-FOV side length in the full-slide mosaic figures.
+        fov_y: Row of the FOV used for the per-FOV heatmap; auto-picked
+            (highest mean score) when ``None``. Applied to every slide.
+        fov_x: Column of the FOV used for the per-FOV heatmap; auto-picked
+            (highest mean score) when ``None``. Applied to every slide.
+        fov_stride: Sliding-window stride for the per-FOV heatmap.
+        export_individual: Also save unannotated panels alongside combined figures.
+        verbose: When ``True``, emit detailed per-chunk and timing logs.
+            Default is to log only warnings/errors plus the per-slide
+            progress bar.
+        write_csv: When ``True``, also dump per-tile
+            ``FOV_y,FOV_x,pixel_y,pixel_x,score`` CSV per slide.
+    """
+    logging.getLogger().setLevel(logging.INFO if verbose else logging.WARNING)
+
+    device = resolve_device(gpu)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    t_model = time.time()
+    model = load_classifier(checkpoint, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    t_model = time.time() - t_model
+    log.info("Loaded model in %.2fs on %s", t_model, device)
+
+    for slide_name in tqdm(slide_list, desc="Slides"):
+        slide_path = slide_root / slide_name
+        try:
+            _score_one_slide(
+                slide_path=slide_path,
+                output_dir=output_dir,
+                device=device,
+                model=model,
+                mask_folder=mask_folder,
+                batch_size=batch_size,
+                tile_size=tile_size,
+                pixel_border=pixel_border,
+                x_border=x_border,
+                y_border=y_border,
+                chunk=chunk,
+                fov_px=fov_px,
+                fov_y=fov_y,
+                fov_x=fov_x,
+                fov_stride=fov_stride,
+                export_individual=export_individual,
+                write_csv=write_csv,
+            )
+        except Exception:
+            log.exception("Failed to score slide %s; continuing", slide_name)
 
 
 if __name__ == "__main__":
