@@ -222,3 +222,4 @@ cython_debug/
 *.local.md
 runs/
 claude/
+pyrefly.toml
