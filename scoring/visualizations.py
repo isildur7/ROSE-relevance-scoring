@@ -32,35 +32,56 @@ def _gpu_mosaic_chunks(
     """Debayer + downsample every FOV on GPU; return ``(Y, X, fov_px, fov_px, 3)`` uint8."""
     import kornia.color as kc  # local import keeps module importable without CUDA
 
+    # Release cached-but-unused allocations from scoring, then size each chunk
+    # so it fits in available memory.  kornia raw_to_rgb peaks at ~13× a single
+    # float32 channel per FOV (input + r/g/b intermediates + cat output).
+    torch.cuda.empty_cache()
+    fov_h, fov_w = images_np.shape[2], images_np.shape[3]
+    bytes_per_fov = 13 * fov_h * fov_w * 4  # empirical kornia peak per 2048×2048 FOV
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    safe_chunk = max(1, int(free_bytes * 0.7 // bytes_per_fov))
+    chunk_size = min(chunk_size, safe_chunk)
+    log.info("mosaic chunk_size=%d (%.0f MiB free)", chunk_size, free_bytes / 2**20)
+
     y_max, x_max = images_np.shape[:2]
     out = np.zeros((y_max, x_max, fov_px, fov_px, 3), dtype=np.uint8)
     fovs: list[tuple[int, int]] = [(y, x) for y in range(y_max) for x in range(x_max)]
 
-    for start in range(0, len(fovs), chunk_size):
-        chunk_fovs = fovs[start : start + chunk_size]
+    cursor = 0
+    while cursor < len(fovs):
+        chunk_fovs = fovs[cursor : cursor + chunk_size]
         rows = np.fromiter((y for y, _ in chunk_fovs), dtype=np.int64)
         cols = np.fromiter((x for _, x in chunk_fovs), dtype=np.int64)
-        bayer_chunk = images_np[rows, cols]
+        bayer_chunk = np.ascontiguousarray(images_np[rows, cols])
         if bayer_chunk.ndim == 4 and bayer_chunk.shape[-1] == 1:
             bayer_chunk = bayer_chunk[..., 0]
-        bayer_chunk = np.ascontiguousarray(bayer_chunk)
-        bayer_t = (
-            torch.from_numpy(bayer_chunk).pin_memory().to(device, non_blocking=True)
-        )
-        x = bayer_t.unsqueeze(1).float() / 255.0  # (B, 1, H, W)
-        rgb = kc.raw_to_rgb(x, kc.CFA.GR).clamp(0.0, 1.0)  # (B, 3, H, W)
-        small = F.interpolate(rgb, size=(fov_px, fov_px), mode="area")
-        small_u8 = (
-            (small * 255.0)
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(0, 2, 3, 1)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-        for i, (y_idx, x_idx) in enumerate(chunk_fovs):
-            out[y_idx, x_idx] = small_u8[i]
+        try:
+            bayer_t = (
+                torch.from_numpy(bayer_chunk).pin_memory().to(device, non_blocking=True)
+            )
+            x = bayer_t.unsqueeze(1).float() / 255.0  # (B, 1, H, W)
+            del bayer_t
+            rgb = kc.raw_to_rgb(x, kc.CFA.GR).clamp(0.0, 1.0)  # (B, 3, H, W)
+            del x
+            small = F.interpolate(rgb, size=(fov_px, fov_px), mode="area")
+            del rgb
+            small_u8 = (
+                (small * 255.0)
+                .clamp(0, 255)
+                .to(torch.uint8)
+                .permute(0, 2, 3, 1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            del small
+            for i, (y_idx, x_idx) in enumerate(chunk_fovs):
+                out[y_idx, x_idx] = small_u8[i]
+            cursor += len(chunk_fovs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            chunk_size = max(1, chunk_size // 2)
+            log.warning("OOM in mosaic chunk; retrying with chunk_size=%d", chunk_size)
     return out
 
 
