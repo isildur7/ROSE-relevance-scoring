@@ -487,17 +487,20 @@ def _run_diagnostics(
     datamodule: PatchDataModule,
     exp_dir: Path,
     device: torch.device,
+    tag: str = "best-auroc",
 ) -> dict:
-    """Load the best checkpoint and compute diagnostics for all three splits.
+    """Load a checkpoint and compute diagnostics for all three splits.
 
-    Saves confusion matrix and ROC curve PNGs to ``exp_dir/figures/`` and
-    writes ``exp_dir/results.pkl``.
+    Saves confusion matrix and ROC curve PNGs to ``exp_dir/figures/<tag>/``.
 
     Args:
-        ckpt_path: Path to the best-auroc checkpoint.
+        ckpt_path: Path to the checkpoint to evaluate.
         datamodule: Fitted datamodule (``setup()`` already called).
         exp_dir: Experiment directory.
         device: Device to run inference on.
+        tag: Short identifier for the checkpoint (e.g. ``"best-auroc"`` or
+            ``"best-loss"``); used in figure subfolder and log-line prefix
+            so multiple checkpoints can be diagnosed side by side.
 
     Returns:
         Nested dict ``{split: {logits, labels, scores, auc, accuracy, ...}}``.
@@ -511,7 +514,8 @@ def _run_diagnostics(
         "val": datamodule.val_dataloader(),
         "test": datamodule.test_dataloader(),
     }
-    figures_dir = exp_dir / "figures"
+    figures_dir = exp_dir / "figures" / tag
+    figures_dir.mkdir(parents=True, exist_ok=True)
     results: dict = {}
 
     for split, loader in loaders.items():
@@ -522,13 +526,13 @@ def _run_diagnostics(
             labels,
             scores,
             figures_dir / f"{split}_confusion.png",
-            f"{split.capitalize()} — Confusion Matrix",
+            f"{split.capitalize()} ({tag}) — Confusion Matrix",
         )
         _save_roc_curve(
             labels,
             scores,
             figures_dir / f"{split}_roc.png",
-            f"{split.capitalize()} — ROC",
+            f"{split.capitalize()} ({tag}) — ROC",
         )
 
         results[split] = {
@@ -537,7 +541,8 @@ def _run_diagnostics(
             **metrics,
         }
         log.info(
-            "[%s] AUC=%.4f  Acc=%.4f  Precision=%.4f  Recall=%.4f  F1=%.4f",
+            "[%s/%s] AUC=%.4f  Acc=%.4f  Precision=%.4f  Recall=%.4f  F1=%.4f",
+            tag,
             split,
             metrics["auc"],
             metrics["accuracy"],
@@ -691,7 +696,7 @@ def main(
     )
     wandb_logger.log_hyperparams(config)
 
-    checkpoint_cb = ModelCheckpoint(
+    auroc_ckpt_cb = ModelCheckpoint(
         dirpath=str(exp_dir / "checkpoints"),
         filename="best-auroc",
         monitor="val/auroc",
@@ -699,26 +704,42 @@ def main(
         save_top_k=1,
         save_last=True,
     )
+    loss_ckpt_cb = ModelCheckpoint(
+        dirpath=str(exp_dir / "checkpoints"),
+        filename="best-loss",
+        monitor="val/loss",
+        mode="min",
+        save_top_k=1,
+    )
 
     trainer = Trainer(
         max_epochs=max_epochs,
         logger=wandb_logger,
-        callbacks=[checkpoint_cb, LearningRateMonitor("epoch")],
+        callbacks=[auroc_ckpt_cb, loss_ckpt_cb, LearningRateMonitor("epoch")],
         log_every_n_steps=10,
         accelerator="gpu" if use_gpu else "cpu",
         devices=[gpu] if use_gpu else 1,
     )
     trainer.fit(model, datamodule=datamodule)
 
-    best_ckpt = Path(checkpoint_cb.best_model_path)
-    log.info("Best checkpoint: %s", best_ckpt)
+    auroc_ckpt = Path(auroc_ckpt_cb.best_model_path)
+    loss_ckpt = Path(loss_ckpt_cb.best_model_path)
+    log.info("best-auroc checkpoint: %s", auroc_ckpt)
+    log.info("best-loss checkpoint:  %s", loss_ckpt)
 
     model_for_test = PatchClassifier.load_from_checkpoint(
-        str(best_ckpt), weights_only=False
+        str(auroc_ckpt), weights_only=False
     )
     trainer.test(model_for_test, datamodule=datamodule)
 
-    results = _run_diagnostics(best_ckpt, datamodule, exp_dir, device)
+    results = {
+        "best-auroc": _run_diagnostics(
+            auroc_ckpt, datamodule, exp_dir, device, tag="best-auroc"
+        ),
+        "best-loss": _run_diagnostics(
+            loss_ckpt, datamodule, exp_dir, device, tag="best-loss"
+        ),
+    }
 
     with open(exp_dir / "results.pkl", "wb") as fh:
         pickle.dump(results, fh)

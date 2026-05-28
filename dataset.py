@@ -13,12 +13,8 @@ from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import v2
 
 PINNED_TRAIN_SLIDES: frozenset[str] = frozenset({"CF14-003066A-1"})
-DATASET_MEAN: list[float] = [
-    0.41638100147247314,
-    0.402768611907959,
-    0.43754714727401733,
-]
-DATASET_STD: list[float] = [0.4178890585899353, 0.4056206941604614, 0.45571383833885193]
+DATASET_MEAN: list[float] = [0.485, 0.456, 0.406]
+DATASET_STD: list[float] = [0.229, 0.224, 0.225]
 
 # Per-slide diagnosis label_id (0..6) used to stratify the slide-level split by
 # diagnosis instead of by patch label. Diagnoses follow ROSE-processing-v2:
