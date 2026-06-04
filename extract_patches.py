@@ -56,6 +56,7 @@ def process_slide(
     slide_df: pd.DataFrame,
     slide_dirs: list[Path],
     output_dir: Path,
+    overwrite: bool,
 ) -> list[dict]:
     """Extract all annotated patches for a single slide.
 
@@ -64,39 +65,79 @@ def process_slide(
     from the raw array: ``raw[top_left_px_x : +256, top_left_px_y : +256]``, then
     ``np.rot90`` (90° CCW) to restore the annotator's view orientation.
 
+    Unless ``overwrite`` is set, patches whose JPEG already exists in ``output_dir``
+    are skipped: a FOV is only loaded and debayered if it has at least one missing
+    patch, and a slide whose patches all exist never opens its .nc file. Skipped
+    patches are still recorded so the returned table stays complete.
+
     Args:
         slide: Slide name used for filenames and locating the .nc file.
         slide_df: Annotation rows for this slide.
         slide_dirs: Ordered list of base directories to search for .nc files.
         output_dir: Directory where JPEG patches will be written.
+        overwrite: If True, (re)write every patch even if its JPEG already exists.
+            If False, skip patches already present on disk.
 
     Returns:
-        List of ``{"filepath": str, "label": int}`` dicts for every saved patch.
+        List of ``{"filepath": str, "label": int}`` dicts for every annotated patch
+        (both newly written and pre-existing).
     """
     nc_path = find_nc(slide, slide_dirs)
-    log.info("Loading %s for slide %s", nc_path.name, slide)
-    dataset = mcam_data.load(nc_path, delayed=True)
-    images = dataset["images"]  # (image_y, image_x, y, x)
+    images = None  # loaded lazily; a fully-extracted slide never opens its .nc
 
     records: list[dict] = []
     for (fov_r, fov_c), fov_df in slide_df.groupby(["fov_r", "fov_c"]):
+        targets = [
+            (
+                row,
+                f"{slide}__fovr{fov_r}-fovc{fov_c}"
+                f"__pr{int(row['patch_r'])}-pc{int(row['patch_c'])}.jpg",
+            )
+            for _, row in fov_df.iterrows()
+        ]
+        # Record every annotated patch so the output table stays complete.
+        records.extend(
+            {"filepath": fname, "label": int(row["label"])} for row, fname in targets
+        )
+
+        to_write = (
+            targets
+            if overwrite
+            else [(r, f) for r, f in targets if not (output_dir / f).exists()]
+        )
+        if not to_write:
+            log.info(
+                "  [%s] FOV (%s, %s): all %d patches present, skipping.",
+                slide,
+                fov_r,
+                fov_c,
+                len(targets),
+            )
+            continue
+
+        if images is None:
+            log.info("Loading %s for slide %s", nc_path.name, slide)
+            dataset = mcam_data.load(nc_path, delayed=True)
+            images = dataset["images"]  # (image_y, image_x, y, x)
+
         bayer = images.isel(image_y=fov_r, image_x=fov_c).values
         rgb = cv2.cvtColor(bayer, BAYER_FLAG)
 
-        for _, row in fov_df.iterrows():
+        for row, fname in to_write:
             raw_row = int(row["top_left_px_x"])
             raw_col = int(row["top_left_px_y"])
             patch = rgb[raw_row : raw_row + PATCH_SIZE, raw_col : raw_col + PATCH_SIZE]
             patch = np.rot90(patch)
-
-            fname = (
-                f"{slide}__fovr{fov_r}-fovc{fov_c}"
-                f"__pr{int(row['patch_r'])}-pc{int(row['patch_c'])}.jpg"
-            )
             iio.imwrite(output_dir / fname, patch)
-            records.append({"filepath": fname, "label": int(row["label"])})
 
-        log.info("  [%s] FOV (%s, %s): %d patches saved.", slide, fov_r, fov_c, len(fov_df))
+        log.info(
+            "  [%s] FOV (%s, %s): %d patches written, %d skipped.",
+            slide,
+            fov_r,
+            fov_c,
+            len(to_write),
+            len(targets) - len(to_write),
+        )
 
     return records
 
@@ -106,6 +147,7 @@ def extract_patches(
     slide_dirs: list[Path],
     output_dir: Path,
     num_workers: int,
+    overwrite: bool,
 ) -> pd.DataFrame:
     """Extract patches for all slides, processing slides in parallel.
 
@@ -115,6 +157,7 @@ def extract_patches(
         slide_dirs: Ordered list of base directories to search for .nc files.
         output_dir: Directory where JPEG patches will be written.
         num_workers: Number of parallel worker processes.
+        overwrite: If True, (re)write every patch even if its JPEG already exists.
 
     Returns:
         DataFrame with columns ``filepath`` (relative to ``output_dir``) and ``label``.
@@ -125,7 +168,9 @@ def extract_patches(
     all_records: list[dict] = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {
-            executor.submit(process_slide, slide, slide_df, slide_dirs, output_dir): slide
+            executor.submit(
+                process_slide, str(slide), slide_df, slide_dirs, output_dir, overwrite
+            ): slide
             for slide, slide_df in slides
         }
         for future in as_completed(futures):
@@ -146,6 +191,7 @@ def main(
     slide_dirs: list[Path],
     num_workers: int = 8,
     test: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """Run patch extraction.
 
@@ -157,23 +203,28 @@ def main(
             and CPU count). Defaults to 8.
         test: If True, process only one slide/FOV (CF14-003066A-1, FOV 12/8) for
             visual verification.
+        overwrite: If True, (re)write every patch even if its JPEG already exists.
+            Defaults to False, which skips patches already present in ``output_dir``
+            and only extracts newly annotated ones.
     """
     df = pd.read_parquet(annotations)
     df = df[df["label"].isin([0, 1])].reset_index(drop=True)
 
     if test:
         df = df[
-            (df["slide"] == "CF14-003066A-1")
-            & (df["fov_r"] == 12)
-            & (df["fov_c"] == 8)
+            (df["slide"] == "CF14-003066A-1") & (df["fov_r"] == 12) & (df["fov_c"] == 8)
         ]
-        log.info("TEST MODE: %d patches from slide CF14-003066A-1, FOV (12, 8)", len(df))
+        log.info(
+            "TEST MODE: %d patches from slide CF14-003066A-1, FOV (12, 8)", len(df)
+        )
 
     n_slides = df["slide"].nunique()
-    resolved_workers = num_workers if num_workers > 0 else min(n_slides, os.cpu_count() or 8)
+    resolved_workers = (
+        num_workers if num_workers > 0 else min(n_slides, os.cpu_count() or 8)
+    )
     log.info("Processing %d slides with %d workers.", n_slides, resolved_workers)
 
-    result_df = extract_patches(df, slide_dirs, output_dir, resolved_workers)
+    result_df = extract_patches(df, slide_dirs, output_dir, resolved_workers, overwrite)
 
     ann_path = output_dir / "patches_annotations.parquet"
     result_df.to_parquet(ann_path, index=False)
