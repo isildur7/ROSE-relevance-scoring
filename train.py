@@ -66,6 +66,10 @@ class PatchClassifier(LightningModule):
         architecture: ``"resnet18"`` or ``"efficientnet_b0"``.
         dropout_rate: Dropout probability inserted before the classification head.
             ``0.0`` disables dropout.
+        label_smoothing: BCE target smoothing factor ε applied to the training
+            loss only. Targets become ``y*(1-ε) + ε/2`` (1 → 1-ε/2, 0 → ε/2).
+            ``0.0`` disables smoothing. Validation/test losses and all metrics
+            use hard labels.
     """
 
     def __init__(
@@ -78,6 +82,7 @@ class PatchClassifier(LightningModule):
         architecture: Literal["resnet18", "efficientnet_b0"] = "resnet18",
         dropout_rate: float = 0.0,
         freeze_layers: int = 0,
+        label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -85,6 +90,7 @@ class PatchClassifier(LightningModule):
         self._weight_decay: float = weight_decay
         self._max_epochs: int = max_epochs
         self._lr_schedule: Literal["cosine", "constant"] = lr_schedule
+        self._label_smoothing: float = label_smoothing
 
         if architecture == "efficientnet_b0":
             weights = tvm.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
@@ -152,7 +158,8 @@ class PatchClassifier(LightningModule):
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         imgs, labels = batch
         probs = self(imgs).squeeze(1)
-        loss = self.criterion(probs, labels)
+        targets = labels * (1.0 - self._label_smoothing) + 0.5 * self._label_smoothing
+        loss = self.criterion(probs, targets)
         self.train_loss.update(loss)
         self.train_auroc.update(probs, labels.int())
         self.train_acc.update(probs, labels.int())
@@ -579,6 +586,7 @@ def main(
     dropout_rate: float = 0.0,
     aug_strength: Literal["mild", "strong"] = "mild",
     freeze_layers: int = 0,
+    label_smoothing: float = 0.0,
 ) -> None:
     """Train a binary patch classifier.
 
@@ -611,6 +619,9 @@ def main(
         freeze_layers: Number of ResNet18 backbone stages to freeze (0 = train all;
             1 = freeze stem; 2 = freeze stem + layer1; 3 = freeze stem + layer1 + layer2;
             4 = freeze stem through layer3). Only applies to ``architecture="resnet18"``.
+        label_smoothing: BCE target smoothing factor ε for the training loss only
+            (``y*(1-ε) + ε/2``). ``0.0`` (default) disables it; val/test losses and
+            all metrics use hard labels.
     """
     seed_everything(seed, workers=True)
 
@@ -648,6 +659,7 @@ def main(
         "architecture": architecture,
         "dropout_rate": dropout_rate,
         "aug_strength": aug_strength,
+        "label_smoothing": label_smoothing,
     }
     with open(exp_dir / "config.yml", "w") as fh:
         yaml.dump(config, fh, default_flow_style=False)
@@ -686,6 +698,7 @@ def main(
         architecture=architecture,
         dropout_rate=dropout_rate,
         freeze_layers=freeze_layers,
+        label_smoothing=label_smoothing,
     )
 
     wandb_logger = WandbLogger(
