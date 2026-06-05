@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -100,8 +99,9 @@ def main(
     labels = df["label"].to_numpy(dtype=np.int64)
 
     if output_path.exists() and limit == 0:
-        cached = np.load(output_path, allow_pickle=True)
-        if cached["features"].shape[0] == len(filepaths):
+        with np.load(output_path, allow_pickle=True) as cached:
+            complete = cached["features"].shape[0] == len(filepaths)
+        if complete:
             logger.info("Embeddings already complete at %s; skipping.", output_path)
             return
         logger.info("Existing npz row count mismatch; recomputing.")
@@ -127,11 +127,12 @@ def main(
         pin_memory=True,
     )
 
+    device_type = device.split(":")[0]
     feats = np.empty((len(filepaths), backbone.embed_dim), dtype=np.float16)
     with torch.inference_mode():
         for imgs, idx in loader:
             imgs = imgs.to(device, non_blocking=True)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 out = backbone(imgs)
             feats[idx.numpy()] = (
                 out.detach().to(torch.float32).cpu().numpy().astype(np.float16)
@@ -149,6 +150,11 @@ def main(
 
 
 if __name__ == "__main__":
+    import logging as _logging
+
     from jsonargparse import CLI
 
+    _logging.basicConfig(
+        level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     CLI(main)
