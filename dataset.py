@@ -1,5 +1,6 @@
 """PatchDataset, balanced batch sampler, slide-level splits, and image transforms."""
 
+import json
 import random
 from pathlib import Path
 from typing import Literal
@@ -16,40 +17,89 @@ PINNED_TRAIN_SLIDES: frozenset[str] = frozenset({"CF14-003066A-1"})
 DATASET_MEAN: list[float] = [0.485, 0.456, 0.406]
 DATASET_STD: list[float] = [0.229, 0.224, 0.225]
 
-# Per-slide diagnosis label_id (0..6) used to stratify the slide-level split by
-# diagnosis instead of by patch label. Diagnoses follow ROSE-processing-v2:
-#   0 Adenocarcinoma, 1 Benign Lung, 2 Benign Lymph node,
-#   3 Granulomatous Inflammation, 4 Lymphoma,
-#   5 Small cell carcinoma, 6 Squamous cell carcinoma.
-SLIDE_TO_DIAGNOSIS: dict[str, int] = {
-    "CF14-003066A-1": 6,
-    "CF14-003074A-1": 1,
-    "CF14-003074A-2": 1,
-    "CF14-003223A-1": 3,
-    "CF14-003223A-2": 3,
-    "CF14-003223B-3": 3,
-    "CF14-003233D-1": 0,
-    "CF14-003233D-4": 0,
-    "CF14-003233D-5": 0,
-    "CF14-003323B-3": 4,
-    "CF14-003323B-4": 4,
-    "CF14-003323B-5": 4,
-    "CF14-003514A-2": 2,
-    "CF14-003514B-3": 2,
-    "CF14-003514B-4": 2,
-    "CF15-000056A-1": 0,
-    "CF15-000056A-2": 0,
-    "CF15-000109A-1": 6,
-    "CF15-000109A-2": 6,
-    "CF15-000109A-4": 6,
-    "CF15-000115A-1": 6,
-    "CF15-000115A-2": 6,
-    "CF15-000115A-3": 6,
-    "CF15-000205A-2": 5,
-    "CF15-000205A-3": 5,
-    "CF15-000606A-2": 6,
-    "CF15-001032A-1": 5,
-}
+# Default location of the ROSE-processing-v2 scans metadata. Overridable via the
+# ``scans_info_path`` argument wherever slide diagnoses are needed.
+DEFAULT_SCANS_INFO_PATH: Path = Path(
+    "/home/amey/ROSE-processing-v2/data_jsons/scans_info.json"
+)
+
+
+def load_slide_diagnoses(
+    scans_info_path: Path = DEFAULT_SCANS_INFO_PATH,
+) -> dict[str, int]:
+    """Load a ``{slide_name: diagnosis_id}`` map from the scans_info JSONL file.
+
+    ``scans_info.json`` has one JSON object per line, each with ``patient_id``,
+    ``slide`` and ``label`` (diagnosis id 0..6; ``-1`` = undiagnosed). The full
+    slide name is ``patient_id + slide`` (e.g. ``"CF15-001295" + "A-1"`` ->
+    ``"CF15-001295A-1"``). Diagnoses follow ROSE-processing-v2:
+    0 Adenocarcinoma, 1 Benign Lung, 2 Benign Lymph node,
+    3 Granulomatous Inflammation, 4 Lymphoma, 5 Small cell carcinoma,
+    6 Squamous cell carcinoma.
+
+    Args:
+        scans_info_path: Path to ``scans_info.json`` (one JSON object per line).
+
+    Returns:
+        Mapping from full slide name to diagnosis id.
+
+    Raises:
+        FileNotFoundError: If ``scans_info_path`` does not exist.
+    """
+    if not scans_info_path.exists():
+        raise FileNotFoundError(f"scans_info file not found: {scans_info_path}")
+    diagnoses: dict[str, int] = {}
+    with scans_info_path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            diagnoses[f"{rec['patient_id']}{rec['slide']}"] = int(rec["label"])
+    return diagnoses
+
+
+def assign_slide_folds(
+    slides: list[str],
+    slide_diagnoses: dict[str, int],
+    seed: int,
+) -> dict[str, str]:
+    """Assign each slide to ``"train"``/``"val"``/``"test"`` (~60/20/20).
+
+    Uses ``StratifiedGroupKFold(n_splits=5)`` over the unpinned slides —
+    stratified by diagnosis, grouped by slide — then maps folds 0-2 -> train,
+    3 -> val, 4 -> test (≈ 60/20/20 by slide count). Slides in
+    ``PINNED_TRAIN_SLIDES`` are forced into train and excluded from the fold split.
+
+    Args:
+        slides: Full set of slide names to assign.
+        slide_diagnoses: ``{slide_name: diagnosis_id}`` covering every entry in
+            ``slides``.
+        seed: Random seed passed to ``StratifiedGroupKFold``.
+
+    Returns:
+        Mapping from slide name to ``"train"``, ``"val"`` or ``"test"``.
+    """
+    pinned = set(PINNED_TRAIN_SLIDES)
+    unpinned = np.array(sorted(s for s in slides if s not in pinned))
+    slide_dx = np.array([slide_diagnoses[s] for s in unpinned])
+
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+    fold_ids = np.empty(len(unpinned), dtype=int)
+    for fold_idx, (_, test_idx) in enumerate(sgkf.split(unpinned, slide_dx, unpinned)):
+        fold_ids[test_idx] = fold_idx
+
+    fold_to_split: dict[int, str] = {
+        0: "train",
+        1: "train",
+        2: "train",
+        3: "val",
+        4: "test",
+    }
+    assignment: dict[str, str] = {s: "train" for s in slides if s in pinned}
+    for slide, fold in zip(unpinned, fold_ids):
+        assignment[str(slide)] = fold_to_split[int(fold)]
+    return assignment
 
 
 def make_splits(
@@ -57,18 +107,17 @@ def make_splits(
     patch_dir: Path,
     seed: int = 1953,
     split_mode: Literal["slide", "random"] = "slide",
+    scans_info_path: Path = DEFAULT_SCANS_INFO_PATH,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split the patch annotation table into train / val / test sets.
 
     Two modes are supported:
 
-    * ``"slide"`` (default): slide-level 3-fold split, **stratified by slide
-      diagnosis** (``label_id`` 0..6 from ``SLIDE_TO_DIAGNOSIS``) and grouped
-      by slide. Folds are then assigned: fold 0 → train, fold 1 → val,
-      fold 2 → test. ``CF14-003066A-1`` is pinned to train. With the default
-      ``seed=1953`` the resulting test fold covers all 7 diagnoses, train
-      covers all 7, and val covers 6 (Benign Lung has only two slides total,
-      so at most two of the three splits can contain it).
+    * ``"slide"`` (default): slide-level ~60/20/20 split, **stratified by slide
+      diagnosis** and grouped by slide, via ``StratifiedGroupKFold(n_splits=5)``
+      with folds 0-2 → train, 3 → val, 4 → test (see ``assign_slide_folds``).
+      Slide diagnoses are read from ``scans_info_path`` (``load_slide_diagnoses``);
+      ``CF14-003066A-1`` is pinned to train.
     * ``"random"``: plain patch-level random split (~60 / 20 / 20), stratified
       by patch label. Slide identity is ignored entirely.
 
@@ -76,10 +125,11 @@ def make_splits(
         parquet_path: Path to ``patches_annotations.parquet`` with columns
             ``filepath`` (filename only) and ``label`` (0 or 1).
         patch_dir: Directory containing the JPEG patches; prepended to each filepath.
-        seed: Random seed passed to ``StratifiedGroupKFold`` (default: 1953;
-            verified to yield the diagnosis-balanced split described above).
+        seed: Random seed passed to ``StratifiedGroupKFold`` (default: 1953).
         split_mode: ``"slide"`` for slide-level diagnosis-stratified splits;
             ``"random"`` for a raw patch-level split.
+        scans_info_path: Path to ``scans_info.json`` providing slide diagnoses.
+            Only used in ``"slide"`` mode.
 
     Returns:
         Tuple of (train_df, val_df, test_df), each with columns
@@ -103,29 +153,18 @@ def make_splits(
 
     df["slide"] = df["filepath"].apply(lambda f: Path(f).stem.split("__fovr")[0])
 
-    missing_dx = set(df["slide"].unique()) - set(SLIDE_TO_DIAGNOSIS)
+    slide_diagnoses = load_slide_diagnoses(scans_info_path)
+    dataset_slides = set(df["slide"].unique())
+    missing_dx = dataset_slides - set(slide_diagnoses)
     if missing_dx:
         raise ValueError(
-            f"SLIDE_TO_DIAGNOSIS is missing entries for: {sorted(missing_dx)}"
+            f"scans_info.json is missing diagnoses for: {sorted(missing_dx)}"
         )
 
-    pinned_slides = set(PINNED_TRAIN_SLIDES)
-    unpinned_slides = np.array(
-        sorted(s for s in df["slide"].unique() if s not in pinned_slides)
-    )
-    slide_dx = np.array([SLIDE_TO_DIAGNOSIS[s] for s in unpinned_slides])
-
-    sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=seed)
-    fold_ids = np.empty(len(unpinned_slides), dtype=int)
-    for fold_idx, (_, test_idx) in enumerate(
-        sgkf.split(unpinned_slides, slide_dx, unpinned_slides)
-    ):
-        fold_ids[test_idx] = fold_idx
-
-    # fold 0 → train (+ pinned slides), fold 1 → val, fold 2 → test
-    train_slides: set[str] = set(unpinned_slides[fold_ids == 0]) | pinned_slides
-    val_slides: set[str] = set(unpinned_slides[fold_ids == 1])
-    test_slides: set[str] = set(unpinned_slides[fold_ids == 2])
+    assignment = assign_slide_folds(sorted(dataset_slides), slide_diagnoses, seed)
+    train_slides = {s for s, split in assignment.items() if split == "train"}
+    val_slides = {s for s, split in assignment.items() if split == "val"}
+    test_slides = {s for s, split in assignment.items() if split == "test"}
 
     train_df = df[df["slide"].isin(train_slides)].reset_index(drop=True)
     val_df = df[df["slide"].isin(val_slides)].reset_index(drop=True)

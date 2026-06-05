@@ -17,7 +17,12 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 
-from dataset import PatchDataset, make_eval_transform, make_splits
+from dataset import (
+    DEFAULT_SCANS_INFO_PATH,
+    PatchDataset,
+    make_eval_transform,
+    make_splits,
+)
 from train import PatchClassifier
 
 log = logging.getLogger(__name__)
@@ -33,6 +38,7 @@ def main(
     num_workers: int = 8,
     gpu: int = 0,
     split_mode: Literal["slide", "random"] = "slide",
+    scans_info_path: Path = DEFAULT_SCANS_INFO_PATH,
 ) -> None:
     """Run the test split through a trained checkpoint and print metrics.
 
@@ -48,8 +54,12 @@ def main(
         num_workers: DataLoader workers.
         gpu: GPU index to use (0-based). Ignored if CUDA is unavailable.
         split_mode: ``"slide"`` or ``"random"`` — must match the training run.
+        scans_info_path: Path to ``scans_info.json`` providing slide diagnoses for
+            slide-level splits — must match the training run.
     """
-    _, _, test_df = make_splits(parquet_path, patch_dir, seed, split_mode)
+    _, _, test_df = make_splits(
+        parquet_path, patch_dir, seed, split_mode, scans_info_path
+    )
     log.info(
         "Test split: %d patches (%d positive, %d negative)",
         len(test_df),

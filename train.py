@@ -40,6 +40,7 @@ from torchmetrics import MeanMetric
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC, BinaryRecall
 
 from dataset import (
+    DEFAULT_SCANS_INFO_PATH,
     BalancedBatchSampler,
     PatchDataset,
     make_eval_transform,
@@ -253,6 +254,8 @@ class PatchDataModule(LightningDataModule):
         sampling_mode: ``"undersample"`` or ``"oversample"``.
         split_mode: ``"slide"`` for slide-level splits; ``"random"`` for patch-level.
         aug_strength: ``"mild"`` or ``"strong"`` — passed to ``make_train_transform``.
+        scans_info_path: Path to ``scans_info.json`` providing slide diagnoses for
+            slide-level splits.
     """
 
     def __init__(
@@ -266,6 +269,7 @@ class PatchDataModule(LightningDataModule):
         sampling_mode: Literal["undersample", "oversample"] = "undersample",
         split_mode: Literal["slide", "random"] = "slide",
         aug_strength: Literal["mild", "strong"] = "mild",
+        scans_info_path: Path = DEFAULT_SCANS_INFO_PATH,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -278,6 +282,7 @@ class PatchDataModule(LightningDataModule):
         self._sampling_mode: Literal["undersample", "oversample"] = sampling_mode
         self._split_mode: Literal["slide", "random"] = split_mode
         self._aug_strength: Literal["mild", "strong"] = aug_strength
+        self._scans_info_path: Path = scans_info_path
         self.train_df: pd.DataFrame | None = None
         self.val_df: pd.DataFrame | None = None
         self.test_df: pd.DataFrame | None = None
@@ -290,6 +295,7 @@ class PatchDataModule(LightningDataModule):
             self._patch_dir,
             self._split_seed,
             self._split_mode,
+            self._scans_info_path,
         )
         log.info(
             "Split sizes — train: %d, val: %d, test: %d",
@@ -587,6 +593,7 @@ def main(
     aug_strength: Literal["mild", "strong"] = "mild",
     freeze_layers: int = 0,
     label_smoothing: float = 0.0,
+    scans_info_path: Path = DEFAULT_SCANS_INFO_PATH,
 ) -> None:
     """Train a binary patch classifier.
 
@@ -622,6 +629,8 @@ def main(
         label_smoothing: BCE target smoothing factor ε for the training loss only
             (``y*(1-ε) + ε/2``). ``0.0`` (default) disables it; val/test losses and
             all metrics use hard labels.
+        scans_info_path: Path to ``scans_info.json`` providing per-slide diagnoses
+            used to stratify slide-level splits.
     """
     seed_everything(seed, workers=True)
 
@@ -660,6 +669,7 @@ def main(
         "dropout_rate": dropout_rate,
         "aug_strength": aug_strength,
         "label_smoothing": label_smoothing,
+        "scans_info_path": str(scans_info_path),
     }
     with open(exp_dir / "config.yml", "w") as fh:
         yaml.dump(config, fh, default_flow_style=False)
@@ -674,6 +684,7 @@ def main(
         sampling_mode=sampling_mode,
         split_mode=split_mode,
         aug_strength=aug_strength,
+        scans_info_path=scans_info_path,
     )
     datamodule.setup()
 
