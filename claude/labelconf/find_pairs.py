@@ -23,7 +23,12 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from pair_utils import PairCandidate, parse_patch_filename, select_pairs  # noqa: E402
+from pair_utils import (  # noqa: E402
+    PairCandidate,
+    PatchKey,
+    parse_patch_filename,
+    select_pairs,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -73,7 +78,7 @@ def _coord_lookup(annotations_parquet: Path) -> dict[tuple, tuple[int, int]]:
     return dict(zip(keys, vals))
 
 
-def _px(coord: dict[tuple, tuple[int, int]], cand_key: object) -> tuple[int, int]:
+def _px(coord: dict[tuple, tuple[int, int]], cand_key: PatchKey) -> tuple[int, int]:
     """Look up top-left pixel coords for a PatchKey; (-1, -1) if missing."""
     k = (
         cand_key.slide,
