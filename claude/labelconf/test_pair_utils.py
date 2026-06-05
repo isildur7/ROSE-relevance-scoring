@@ -43,6 +43,12 @@ def test_is_adjacent_same_slide_false_when_far() -> None:
     assert is_adjacent_same_slide(k0, k1, adj_tiles=2) is False
 
 
+def test_is_adjacent_same_slide_true_across_fov_boundary() -> None:
+    k0 = PatchKey("s", 0, 0, 7, 0)  # global tile (7, 0)
+    k1 = PatchKey("s", 1, 0, 0, 0)  # global tile (8, 0) -> cheb dist 1
+    assert is_adjacent_same_slide(k0, k1, adj_tiles=1) is True
+
+
 def test_is_adjacent_same_slide_false_for_different_slide() -> None:
     k0 = PatchKey("a", 0, 0, 0, 0)
     k1 = PatchKey("b", 0, 0, 0, 0)

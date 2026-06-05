@@ -7,8 +7,8 @@ A "pair" is one label-0 patch (side 0) and one label-1 patch (side 1).
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 #: Patches are an 8x8 grid of 256px tiles per FOV.
 PATCHES_PER_FOV_EDGE: int = 8
@@ -100,7 +100,7 @@ def is_adjacent_same_slide(k0: PatchKey, k1: PatchKey, adj_tiles: int) -> bool:
 def select_pairs(
     candidates: list[PairCandidate],
     n: int,
-    accept: Optional[Callable[[PairCandidate], bool]] = None,
+    accept: Callable[[PairCandidate], bool] | None = None,
 ) -> list[PairCandidate]:
     """Greedily pick the ``n`` closest pairs, deduping by patch.
 
