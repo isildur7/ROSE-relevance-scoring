@@ -1,17 +1,13 @@
 """Pure helpers for the label-confusion pair finder.
 
-No torch / IO here so the ranking and filtering logic stays unit-testable.
+No torch / IO here so the ranking and selection logic stays unit-testable.
 A "pair" is one label-0 patch (side 0) and one label-1 patch (side 1).
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
-
-#: Patches are an 8x8 grid of 256px tiles per FOV.
-PATCHES_PER_FOV_EDGE: int = 8
 
 _NAME_RE = re.compile(
     r"^(?P<slide>.+)__fovr(?P<fov_r>\d+)-fovc(?P<fov_c>\d+)"
@@ -65,66 +61,26 @@ def parse_patch_filename(filename: str) -> PatchKey:
     )
 
 
-def global_tile_rc(key: PatchKey) -> tuple[int, int]:
-    """Return the patch's (row, col) on the slide-wide tile grid.
+def select_pairs(candidates: list[PairCandidate], n: int) -> list[PairCandidate]:
+    """Greedily pick the ``n`` closest pairs, deduping by the label-1 patch.
 
-    Args:
-        key: A parsed :class:`PatchKey`.
-
-    Returns:
-        ``(row, col)`` in global tile coordinates.
-    """
-    row = key.fov_r * PATCHES_PER_FOV_EDGE + key.patch_r
-    col = key.fov_c * PATCHES_PER_FOV_EDGE + key.patch_c
-    return row, col
-
-
-def is_adjacent_same_slide(k0: PatchKey, k1: PatchKey, adj_tiles: int) -> bool:
-    """Return True if both patches are on the same slide within ``adj_tiles`` (Chebyshev).
-
-    Args:
-        k0: First patch key.
-        k1: Second patch key.
-        adj_tiles: Maximum Chebyshev distance for two patches to be considered adjacent.
-
-    Returns:
-        True if same slide and Chebyshev distance <= ``adj_tiles``.
-    """
-    if k0.slide != k1.slide:
-        return False
-    r0, c0 = global_tile_rc(k0)
-    r1, c1 = global_tile_rc(k1)
-    return max(abs(r0 - r1), abs(c0 - c1)) <= adj_tiles
-
-
-def select_pairs(
-    candidates: list[PairCandidate],
-    n: int,
-    accept: Callable[[PairCandidate], bool] | None = None,
-) -> list[PairCandidate]:
-    """Greedily pick the ``n`` closest pairs, deduping by patch.
-
-    Candidates are sorted ascending by distance. A patch (either side) appears
-    in at most one returned pair, so the result is ``n`` distinct examples.
+    Candidates are sorted ascending by distance. Each label-1 (relevant) patch
+    appears in at most one returned pair; a label-0 patch may recur across pairs.
 
     Args:
         candidates: Candidate pairs (any order).
         n: Number of pairs to return.
-        accept: Optional predicate; a candidate is kept only if it returns True.
 
     Returns:
         Up to ``n`` pairs, ascending by distance.
     """
-    used: set[str] = set()
+    used_label1: set[str] = set()
     chosen: list[PairCandidate] = []
     for cand in sorted(candidates, key=lambda c: c.dist):
-        if cand.fp0 in used or cand.fp1 in used:
-            continue
-        if accept is not None and not accept(cand):
+        if cand.fp1 in used_label1:
             continue
         chosen.append(cand)
-        used.add(cand.fp0)
-        used.add(cand.fp1)
+        used_label1.add(cand.fp1)
         if len(chosen) == n:
             break
     return chosen
