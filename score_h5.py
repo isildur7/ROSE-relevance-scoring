@@ -123,12 +123,13 @@ def _score_one_slide(
     coords_np = data["coords"]
     log.info("Total tiles: %d", images_np.shape[0])
 
-    mini_batches: list[torch.Tensor] = []
-    for start in range(0, images_np.shape[0], batch_size):
-        mini_batches.append(
-            to_model_batch(images_np[start : start + batch_size], device)
-        )
-    scores_np = score_tile_batches(model, mini_batches, device)
+    # Stream batches lazily so only one batch is on the GPU at a time; building
+    # the full list of preprocessed GPU tensors OOMs on large multi-bag slides.
+    batches = (
+        to_model_batch(images_np[start : start + batch_size], device)
+        for start in range(0, images_np.shape[0], batch_size)
+    )
+    scores_np = score_tile_batches(model, batches, device)
     log.info(
         "Scored %d tiles  min=%.3f  max=%.3f  mean=%.3f",
         len(scores_np),
