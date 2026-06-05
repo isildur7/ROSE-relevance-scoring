@@ -30,7 +30,6 @@ from pair_utils import (  # noqa: E402
     select_pairs,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -59,7 +58,7 @@ def _topk_cross_label(
         sims = chunk @ f1.T  # (chunk, n1) cosine similarity
         top = torch.topk(sims, k=topk, dim=1, largest=True)
         col1 = top.indices.cpu().numpy()
-        dist = (1.0 - top.values).cpu().numpy()
+        dist = (1.0 - top.values).clamp_min_(0.0).cpu().numpy()
         row0 = np.repeat(np.arange(start, start + chunk.shape[0]), topk)
         rows.append(row0)
         cols.append(col1.reshape(-1))
@@ -227,6 +226,11 @@ def main(
 
 
 if __name__ == "__main__":
+    import logging as _logging
+
     from jsonargparse import CLI
 
+    _logging.basicConfig(
+        level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     CLI(main)
