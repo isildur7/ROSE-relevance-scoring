@@ -149,7 +149,12 @@ def _montage(
                 f"px({x},{y}) | d={p.dist:.3f}",
                 fontsize=7,
             )
-            ax.axis("off")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor("black")
+                spine.set_linewidth(1.5)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=120)
