@@ -117,7 +117,10 @@ def _map_scores_to_feature_file(
     feature_path: Path,
     bag_lookup: dict[tuple[int, int, int, int], float],
 ) -> None:
-    """Write ``relevance_scores`` into a feature file by ``(coords, cam_xy)`` match.
+    """Write ``relevance_scores`` into a feature file by coordinate match.
+
+    Matches on ``(coords, cam)`` where the FOV index is read from whichever of
+    ``cam_yx`` (e.g. gammasat feature files) or ``cam_xy`` (legacy) is present.
 
     Args:
         feature_path: Feature HDF5 path to update in place.
@@ -125,14 +128,15 @@ def _map_scores_to_feature_file(
             from the parent bag.
     """
     with h5py.File(feature_path, "r+") as f:
-        if "coords" not in f or "cam_xy" not in f:
+        cam_key = next((k for k in ("cam_yx", "cam_xy") if k in f), None)
+        if "coords" not in f or cam_key is None:
             log.warning(
-                "%s: missing coords/cam_xy; skipping feature-file mapping",
+                "%s: missing coords/cam_yx/cam_xy; skipping feature-file mapping",
                 feature_path,
             )
             return
         coords = f["coords"][:]
-        cam_xy = f["cam_xy"][:]
+        cam = f[cam_key][:]
 
         n = coords.shape[0]
         mapped = np.zeros(n, dtype=np.float32)
@@ -141,8 +145,8 @@ def _map_scores_to_feature_file(
             key = (
                 int(coords[i, 0]),
                 int(coords[i, 1]),
-                int(cam_xy[i, 0]),
-                int(cam_xy[i, 1]),
+                int(cam[i, 0]),
+                int(cam[i, 1]),
             )
             score = bag_lookup.get(key)
             if score is None:
@@ -159,6 +163,27 @@ def _map_scores_to_feature_file(
             unmatched,
             n,
         )
+
+
+def _feature_paths_for_bag(bag_path: Path) -> list[Path]:
+    """Find feature h5 files for ``bag_path`` across both naming conventions.
+
+    Feature files are named either ``features_<bag.stem>*.h5`` (underscore kept,
+    e.g. gammasat bags) or ``features_<bag.stem-no-underscore>*.h5`` (underscore
+    stripped, e.g. newfull/oldslides bags). Both are matched and de-duplicated.
+
+    Args:
+        bag_path: Path to the bag h5 whose feature files are sought.
+
+    Returns:
+        Sorted unique list of matching feature-file paths in the bag's directory.
+    """
+    stem = bag_path.stem
+    patterns = {f"features_{stem}*.h5", f"features_{stem.replace('_', '')}*.h5"}
+    paths: set[Path] = set()
+    for pattern in patterns:
+        paths.update(bag_path.parent.glob(pattern))
+    return sorted(paths)
 
 
 def _process_one_bag(
@@ -211,8 +236,7 @@ def _process_one_bag(
         )
         bag_lookup[key] = float(scores[i])
 
-    feature_glob = f"features_{bag_path.stem.replace('_', '')}*.h5"
-    feature_paths = sorted(bag_path.parent.glob(feature_glob))
+    feature_paths = _feature_paths_for_bag(bag_path)
     for feature_path in feature_paths:
         _map_scores_to_feature_file(feature_path, bag_lookup)
         log.info("Mapped scores into %s", feature_path.name)
