@@ -16,6 +16,7 @@ Example:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -43,6 +44,32 @@ from scoring.visualizations import (
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def _patient_ids_from_jsonl(path: Path) -> list[str]:
+    """Read a JSON-Lines file and return its ``patient_id`` column in order.
+
+    Args:
+        path: Path to a ``.json`` / ``.jsonl`` file with one JSON object per
+            line. Each line must contain a ``patient_id`` field, which is used
+            as the slide subdirectory name under ``slide_root``.
+
+    Returns:
+        List of ``patient_id`` strings in file order. Blank lines are skipped.
+    """
+    ids: list[str] = []
+    with path.open("r") as f:
+        for line_num, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "patient_id" not in record:
+                raise ValueError(f"{path}:{line_num}: missing 'patient_id' field")
+            ids.append(str(record["patient_id"]))
+    if not ids:
+        raise ValueError(f"{path}: no records found")
+    return ids
 
 
 def _score_fov_sliding_window(
@@ -184,6 +211,9 @@ def _score_one_slide(
     fov_stride: int,
     export_individual: bool,
     write_csv: bool,
+    write_top6: bool,
+    write_fov_heatmap: bool,
+    write_poster_grid: bool,
 ) -> None:
     """Score one ``.nc`` slide and write its visualizations + optional CSV.
 
@@ -206,6 +236,10 @@ def _score_one_slide(
         fov_stride: Sliding-window stride for the per-FOV heatmap.
         export_individual: Also save unannotated panels.
         write_csv: When ``True``, also dump per-tile scores as a CSV.
+        write_top6: When ``True``, also save the top-6 row figure.
+        write_fov_heatmap: When ``True``, also render the per-FOV heatmap.
+        write_poster_grid: When ``True``, also save the 2x4 poster-grid variant
+            of the top-tiles figure.
     """
     slide_name = slide_path.name
 
@@ -354,9 +388,10 @@ def _score_one_slide(
         scores_np,
         slide_name,
         out_dir / f"{slide_name}_top_tiles.png",
-        poster_grid=True,
+        poster_grid=write_poster_grid,
     )
-    top6_row(tiles_np, scores_np, out_dir / f"{slide_name}_top6_row.png")
+    if write_top6:
+        top6_row(tiles_np, scores_np, out_dir / f"{slide_name}_top6_row.png")
 
     score_histogram(
         scores_np,
@@ -364,6 +399,9 @@ def _score_one_slide(
         total=None,
         title=f"Tile score histogram - {slide_name} (n={len(scores_np)})",
     )
+
+    if not write_fov_heatmap:
+        return
 
     if fov_y is None or fov_x is None:
         fov_y, fov_x = _pick_best_fov(score_lookup)
@@ -399,9 +437,10 @@ def _score_one_slide(
 
 def main(
     slide_root: Path,
-    slide_list: list[str],
     checkpoint: Path,
     output_dir: Path,
+    slide_list: list[str] | None = None,
+    slide_info_json: Path | None = None,
     mask_folder: Path | None = None,
     gpu: int | None = None,
     batch_size: int = 1024,
@@ -417,15 +456,23 @@ def main(
     export_individual: bool = False,
     verbose: bool = False,
     write_csv: bool = False,
+    write_top6: bool = True,
+    write_fov_heatmap: bool = True,
+    write_poster_grid: bool = True,
 ) -> None:
     """Score one or more ``.nc`` slides and write their visualizations.
 
     Args:
         slide_root: Parent directory containing slide subdirectories.
-        slide_list: Names of slide subdirectories under ``slide_root``. Each
-            slide is scored and written to ``output_dir / <name> / *``.
         checkpoint: Trained ``PatchClassifier`` checkpoint (``.ckpt``).
         output_dir: Root output directory.
+        slide_list: Names of slide subdirectories under ``slide_root``. Each
+            slide is scored and written to ``output_dir / <name> / *``.
+            Mutually exclusive with ``slide_info_json``.
+        slide_info_json: Path to a JSON-Lines file (one JSON object per line)
+            with a ``patient_id`` field per record, used as the slide
+            subdirectory name under ``slide_root``. Mutually exclusive with
+            ``slide_list``.
         mask_folder: Directory containing per-FOV pen-mark masks named
             ``<slide>_<row>_<col>.{tif,npy}``. Omit to score every tile.
         gpu: GPU index. ``None`` auto-picks CUDA; ``-1`` forces CPU
@@ -448,8 +495,20 @@ def main(
             progress bar.
         write_csv: When ``True``, also dump per-tile
             ``FOV_y,FOV_x,pixel_y,pixel_x,score`` CSV per slide.
+        write_top6: When ``True`` (default), also save the top-6 row figure.
+        write_fov_heatmap: When ``True`` (default), also render the per-FOV
+            heatmap (the slowest extra panel; skip to speed up batch runs).
+        write_poster_grid: When ``True`` (default), also save the 2x4
+            poster-grid variant of the top-tiles figure.
     """
     logging.getLogger().setLevel(logging.INFO if verbose else logging.WARNING)
+
+    if (slide_list is None) == (slide_info_json is None):
+        raise ValueError("Provide exactly one of --slide_list or --slide_info_json")
+    if slide_info_json is not None:
+        slide_list = _patient_ids_from_jsonl(slide_info_json)
+        log.info("Loaded %d slide IDs from %s", len(slide_list), slide_info_json)
+    assert slide_list is not None  # type narrowing for pyrefly
 
     device = resolve_device(gpu)
     if device.type == "cuda":
@@ -483,10 +542,13 @@ def main(
                 fov_stride=fov_stride,
                 export_individual=export_individual,
                 write_csv=write_csv,
+                write_top6=write_top6,
+                write_fov_heatmap=write_fov_heatmap,
+                write_poster_grid=write_poster_grid,
             )
         except Exception:
             log.exception("Failed to score slide %s; continuing", slide_name)
 
 
 if __name__ == "__main__":
-    CLI(main)
+    CLI(main, as_positional=False)
